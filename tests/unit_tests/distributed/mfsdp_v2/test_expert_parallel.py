@@ -4,11 +4,11 @@
 
 Builds an EP ``HybridModel`` whose single ``"E"`` layer is a ``MoELayer`` (router +
 all-to-all token dispatch + ``TEGroupedMLP`` experts) and shards the whole model with
-mFSDP v2: the EP-partitioned experts over the ``dp`` (expert-data-parallel) axis of a 2-D
-``(dp, ep)`` mesh, and the remaining EP-replicated ("dense") params over the full DP mesh.
-The composition must be numerically transparent (matches an EP-only baseline that has no
-mFSDP applied) and must place each expert weight on the expert-DP sub-mesh (ep excluded)
-while dense params shard over all ranks.
+mFSDP v2: the EP-partitioned experts over a 1-D expert-DP mesh (sliced from a ``(dp, ep)``
+mesh), and the remaining EP-replicated ("dense") params over the full 1-D DP mesh. The
+composition must be numerically transparent (matches an EP-only baseline that has no mFSDP
+applied) and must place each expert weight on the expert-DP sub-mesh (ep excluded) while
+dense params shard over all ranks.
 
 Mesh topology and model shapes are test-local so different tests can pick different
 ``(ep, dp)`` splits.
@@ -102,10 +102,11 @@ def _build_hybrid_model(config: TransformerConfig) -> HybridModel:
 def test_hybrid_model_shards_experts_and_dense(distributed_setup, model_parallel):
     """mFSDP v2 shards an entire EP HybridModel: experts over expert-DP, dense over full DP.
 
-    Composes two nested (bottom-up) fully_shard calls -- the experts over the dp sub-mesh
-    of the (dp, ep) mesh, then the remaining EP-replicated ("dense") params over the full
-    DP mesh -- and checks the composition is numerically transparent versus an EP-only
-    baseline (same EP model, no mFSDP) across forward, backward, and optimizer step.
+    Composes two nested (bottom-up) fully_shard calls -- the experts over a 1-D expert-DP
+    mesh (sliced from a (dp, ep) mesh), then the remaining EP-replicated ("dense") params
+    over the full 1-D DP mesh -- and checks the composition is numerically transparent
+    versus an EP-only baseline (same EP model, no mFSDP) across forward, backward, and
+    optimizer step.
     """
     sizes, dp_size = model_parallel
     ep_size = sizes.ep_size
@@ -127,14 +128,17 @@ def test_hybrid_model_shards_experts_and_dense(distributed_setup, model_parallel
     # Identical starting point for the mFSDP-sharded model and the EP-only baseline.
     baseline.load_state_dict(model.state_dict())
 
-    # Bottom-up: experts shard over the expert-DP sub-mesh of the (dp, ep) mesh...
+    # Bottom-up: experts shard over this rank's expert-DP group. Build the 2-D (dp, ep)
+    # mesh (ep innermost, matching MCore's ep-fastest layout) only to slice out the 1-D
+    # expert-DP sub-mesh -- a plain init_device_mesh((dp_size,)) would group the wrong
+    # ranks ({0,1,2,3} instead of the expert-DP {0,2,4,6}).
     ep_mesh = init_device_mesh(device.type, (dp_size, ep_size), mesh_dim_names=("dp", "ep"))
     experts = model.decoder.layers[0].mlp.experts
     fully_shard(
         experts,
-        mesh=ep_mesh,
+        mesh=ep_mesh["dp"],
         placements=Placements(
-            dp_axes=["dp"], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
+            dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
         ),
     )
     # ...then the remaining EP-replicated params shard over the full DP mesh.
