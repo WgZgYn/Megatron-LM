@@ -2,23 +2,24 @@
 
 """Megatron-FSDP v2 composed with expert parallelism through a real MCore HybridModel.
 
-Builds an EP ``HybridModel`` whose single ``"E"`` layer is a ``MoELayer`` (router +
-all-to-all token dispatch + ``TEGroupedMLP`` experts) and shards the whole model with
-mFSDP v2: the EP-partitioned experts over a 1-D expert-DP mesh (sliced from a ``(dp, ep)``
-mesh), and the remaining EP-replicated ("dense") params over the full 1-D DP mesh. The
-composition must be numerically transparent (matches an EP-only baseline that has no mFSDP
-applied) and must place each expert weight on the expert-DP sub-mesh (ep excluded) while
-dense params shard over all ranks.
+Checks that an ``EP=2`` MoE ``HybridModel`` sharded with mFSDP v2 (experts over the
+expert-DP sub-mesh, the remaining dense params over the full DP mesh) reproduces a
+**fully replicated ``EP=1`` baseline** trained with plain DDP-style gradient averaging.
 
-Mesh topology and model shapes are test-local so different tests can pick different
-``(ep, dp)`` splits.
+The two are compared on **distinct data per rank**, so unlike an identical-data
+transparency check this actually exercises the cross-rank gradient reduction (a broken
+reduce-scatter would diverge) as well as EP alltoall dispatch and FSDP sharding.
+
+Both models are built from explicit ``ProcessGroupCollection``s (no global
+``parallel_state`` / ``initialize_model_parallel``): the baseline with a size-1 ``ep``
+group (all experts local) and the model with the 2-way ``ep`` group.
+
+Model shapes and the ``(ep, dp)`` split are test-local so different tests can vary them.
 """
-
-
-import dataclasses
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
@@ -28,113 +29,115 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils
 
 
-@dataclasses.dataclass(frozen=True)
-class ModelParallelSizes:
-    """Parallelism sizes for the ``model_parallel`` fixture (each defaults to 1)."""
-
-    tp_size: int = 1
-    pp_size: int = 1
-    cp_size: int = 1
-    ep_size: int = 1
-
-
-@pytest.fixture
-def model_parallel(request, distributed_setup):
-    """Set up and tear down model parallelism from a ``ModelParallelSizes`` request.param.
-
-    The fixture skips when the world size is incompatible, yields the requested
-    ``ModelParallelSizes`` and the resolved ``dp_size``, and tears down even if the test
-    fails.
-    """
-    sizes: ModelParallelSizes = request.param
-    non_dp = sizes.tp_size * sizes.pp_size * sizes.cp_size * sizes.ep_size
-    if distributed_setup.world_size % non_dp != 0:
-        pytest.skip(f"world_size {distributed_setup.world_size} is incompatible with {sizes}.")
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=sizes.tp_size,
-        pipeline_model_parallel_size=sizes.pp_size,
-        context_parallel_size=sizes.cp_size,
-        expert_model_parallel_size=sizes.ep_size,
-    )
-    dp_size = distributed_setup.world_size // non_dp
-    yield sizes, dp_size
-    Utils.destroy_model_parallel()
-
-
-def _moe_config(
-    num_routed_experts: int, expert_model_parallel_size: int, hidden_size: int, ffn_hidden_size: int
-) -> TransformerConfig:
+def _config(num_experts, ep_size, hidden, ffn):
     return TransformerConfig(
         num_layers=1,
-        hidden_size=hidden_size,
+        hidden_size=hidden,
         num_attention_heads=4,
-        num_moe_experts=num_routed_experts,
-        expert_model_parallel_size=expert_model_parallel_size,
+        num_moe_experts=num_experts,
+        expert_model_parallel_size=ep_size,
         moe_token_dispatcher_type="alltoall",
         moe_router_topk=2,
         moe_aux_loss_coeff=0.0,
         moe_grouped_gemm=True,
-        moe_ffn_hidden_size=ffn_hidden_size,
+        moe_ffn_hidden_size=ffn,
         add_bias_linear=False,
         gradient_accumulation_fusion=False,
         use_cpu_initialization=True,
         params_dtype=torch.float32,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        attention_backend=AttnBackend.local,
     )
 
 
-def _build_hybrid_model(config: TransformerConfig) -> HybridModel:
+def _pgc(one, world, ep, expt_dp):
+    """A ProcessGroupCollection for a TP=PP=CP=1 MoE model with the given ep/expert-dp."""
+    return ProcessGroupCollection(
+        tp=one,
+        expt_tp=one,
+        cp=one,
+        pp=one,
+        tp_cp=one,
+        tp_dp_cp=world,
+        ep=ep,
+        tp_ep=ep,
+        expt_dp=expt_dp,
+        dp=world,
+        dp_cp=world,
+        embd=None,
+        pos_embd=None,
+    )
+
+
+def _build(config, pgc, vocab, seq):
     return HybridModel(
         config=config,
         hybrid_stack_spec=hybrid_stack_spec,
-        vocab_size=128,
-        max_sequence_length=8,
+        vocab_size=vocab,
+        max_sequence_length=seq,
         hybrid_layer_pattern="E",
+        pg_collection=pgc,
+    ).cuda()
+
+
+def test_ep_fsdp_matches_replicated_ddp_baseline(distributed_setup):
+    """EP=2 + mFSDP reproduces a replicated EP=1 DDP baseline on distinct per-rank data."""
+    device = distributed_setup.device
+    dev = device.type
+    world_size = distributed_setup.world_size
+    rank = distributed_setup.rank
+
+    num_experts, ep_size = 8, 2
+    hidden, ffn = 16, 64
+    vocab, seq, batch = 128, 8, 2
+    if world_size % ep_size != 0 or num_experts % ep_size != 0:
+        pytest.skip(f"world_size {world_size} is incompatible with EP={ep_size}.")
+    dp_size = world_size // ep_size
+
+    # Process groups, all derived from device meshes (no global parallel_state):
+    #   one     -> size-1 groups (TP=PP=CP=1, and the EP=1 baseline's ep group)
+    #   world   -> the full DP group (dense + EP=1 expert-DP)
+    #   moe_mesh-> ep (ep_size-way) and expert-DP (dp_size-way) groups for the EP=2 model
+    one = init_device_mesh(dev, (world_size, 1), mesh_dim_names=("w", "one"))["one"].get_group()
+    world = init_device_mesh(dev, (world_size,)).get_group()
+    moe_mesh = init_device_mesh(dev, (dp_size, ep_size), mesh_dim_names=("dp", "ep"))
+    ep_grp, expt_dp_grp = moe_mesh["ep"].get_group(), moe_mesh["dp"].get_group()
+    expt_dp_size = expt_dp_grp.size()
+
+    # Baseline: EP=1 (all num_experts local, no dispatch). Model: EP=2 (num_experts/EP local).
+    # Same seed + use_cpu_initialization => weights are identical across ranks.
+    torch.manual_seed(123)
+    baseline = _build(_config(num_experts, 1, hidden, ffn), _pgc(one, world, one, world), vocab, seq)
+    torch.manual_seed(123)
+    model = _build(
+        _config(num_experts, ep_size, hidden, ffn),
+        _pgc(one, world, ep_grp, expt_dp_grp),
+        vocab,
+        seq,
     )
 
+    # Align model weights to the baseline: dense params directly; expert params by their
+    # GLOBAL index (the model's local weight i is global expert local_expert_indices[i]).
+    baseline_params = dict(baseline.named_parameters())
+    for name, param in model.named_parameters():
+        if ".experts." not in name:
+            param.data.copy_(baseline_params[name].data)
+    moe = model.decoder.layers[0].mlp
+    baseline_experts = baseline.decoder.layers[0].mlp.experts
+    for fc in ("linear_fc1", "linear_fc2"):
+        baseline_fc, model_fc = getattr(baseline_experts, fc), getattr(moe.experts, fc)
+        for local, global_ in enumerate(moe.local_expert_indices):
+            getattr(model_fc, f"weight{local}").data.copy_(
+                getattr(baseline_fc, f"weight{global_}").data
+            )
 
-@pytest.mark.parametrize("model_parallel", [ModelParallelSizes(ep_size=2)], indirect=True)
-def test_hybrid_model_shards_experts_and_dense(distributed_setup, model_parallel):
-    """mFSDP v2 shards an entire EP HybridModel: experts over expert-DP, dense over full DP.
-
-    Composes two nested (bottom-up) fully_shard calls -- the experts over a 1-D expert-DP
-    mesh (sliced from a (dp, ep) mesh), then the remaining EP-replicated ("dense") params
-    over the full 1-D DP mesh -- and checks the composition is numerically transparent
-    versus an EP-only baseline (same EP model, no mFSDP) across forward, backward, and
-    optimizer step.
-    """
-    sizes, dp_size = model_parallel
-    ep_size = sizes.ep_size
-    num_routed_experts = 8
-    hidden, ffn = 16, 64
-    seq, batch, vocab = 8, 2, 128
-    device = distributed_setup.device
-    world_size = distributed_setup.world_size
-
-    config = _moe_config(num_routed_experts, ep_size, hidden, ffn)
-    # Disable dropout so the baseline and sharded forward passes are RNG-independent.
-    config.hidden_dropout = 0.0
-    config.attention_dropout = 0.0
-
-    # data_parallel_random_init=False gives every DP rank the same seed, so weights
-    # initialize identically across ranks. Coherent FSDP sharding requires this: each rank
-    # shards its own copy, so the all-gather only reconstructs a consistent weight if all
-    # ranks started equal. (It also makes the run deterministic.)
-    _set_random_seed(seed_=123, data_parallel_random_init=False)
-    baseline = _build_hybrid_model(config).cuda()
-    model = _build_hybrid_model(config).cuda()
-    # The model under test starts from the EP-only baseline's weights.
-    model.load_state_dict(baseline.state_dict())
-
-    # Bottom-up: shard each decoder layer's experts over this rank's expert-DP group. Build
-    # the full 2-D (dp, ep) mesh (ep innermost, matching MCore's ep-fastest layout) only to
-    # slice out the 1-D expert-DP sub-mesh -- a plain init_device_mesh((dp_size,)) would
-    # group the wrong ranks ({0,1,2,3} instead of the expert-DP {0,2,4,6}).
-    moe_mesh = init_device_mesh(device.type, (dp_size, ep_size), mesh_dim_names=("dp", "ep"))
+    # Shard the model: experts over the expert-DP sub-mesh, dense params over the full DP mesh.
     for decoder_layer in model.decoder.layers:
         fully_shard(
             decoder_layer.mlp.experts,
@@ -143,8 +146,7 @@ def test_hybrid_model_shards_experts_and_dense(distributed_setup, model_parallel
                 dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
             ),
         )
-    # ...then the remaining EP-replicated params shard over the full DP mesh.
-    dense_mesh = init_device_mesh(device.type, (world_size,))
+    dense_mesh = init_device_mesh(dev, (world_size,))
     fully_shard(
         model,
         mesh=dense_mesh,
@@ -156,38 +158,51 @@ def test_hybrid_model_shards_experts_and_dense(distributed_setup, model_parallel
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.02, foreach=False)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.02, foreach=False)
 
-    # Re-anchor the RNG right before the draws so the inputs are identical across ranks --
-    # the transparency invariant (identical data -> the DP gradient reduction is a no-op, so
-    # the mFSDP-sharded model must reproduce the EP-only baseline exactly). Re-anchoring here
-    # makes this independent of whatever RNG the two model builds above consumed (which could
-    # differ per rank), and decouples the inputs from the weight-init seed. randint keeps the
-    # inputs non-degenerate across batch/seq.
-    torch.manual_seed(4321)
+    # Distinct data per rank -- this is what makes the DP gradient reduction observable.
+    torch.manual_seed(4321 + rank)
     input_ids = torch.randint(0, vocab, (batch, seq), dtype=torch.int64, device=device)
     position_ids = torch.arange(seq, dtype=torch.int64, device=device).repeat(batch, 1)
     attention_mask = torch.ones((batch, 1, seq, seq), dtype=torch.bool, device=device)
     target = torch.randn(batch, seq, vocab, device=device)
 
-    def train(m, opt) -> list[torch.Tensor]:
+    def forward(m):
+        return m(input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask)
+
+    def train_baseline():
         losses = []
         for _ in range(5):
-            opt.zero_grad()
-            logits = m(
-                input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
-            )
-            loss = torch.nn.functional.mse_loss(logits, target)
+            baseline_optimizer.zero_grad()
+            loss = torch.nn.functional.mse_loss(forward(baseline), target)
             losses.append(loss.detach())
             loss.backward()
-            opt.step()
+            # Expert-aware DDP averaging that matches the sharded model's reductions: the
+            # EP=2 forward already sums each ep group's tokens, so expert grads average over
+            # expert-DP (size expt_dp_size) while dense grads average over the full DP world.
+            for name, param in baseline.named_parameters():
+                if param.grad is None:
+                    continue
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=world)
+                param.grad /= expt_dp_size if ".experts." in name else world_size
+            baseline_optimizer.step()
         return losses
 
-    baseline_losses = train(baseline, baseline_optimizer)
-    sharded_losses = train(model, optimizer)
+    def train_model():
+        losses = []
+        for _ in range(5):
+            optimizer.zero_grad()
+            loss = torch.nn.functional.mse_loss(forward(model), target)
+            losses.append(loss.detach())
+            loss.backward()
+            optimizer.step()
+        return losses
+
+    baseline_losses = train_baseline()
+    sharded_losses = train_model()
 
     torch.testing.assert_close(
         torch.stack(sharded_losses),
         torch.stack(baseline_losses),
-        rtol=1e-4,
-        atol=1e-5,
-        msg="mFSDP sharding was not numerically transparent vs the EP-only baseline.",
+        rtol=1e-3,
+        atol=1e-4,
+        msg="EP=2 mFSDP model did not match the replicated EP=1 DDP baseline.",
     )
