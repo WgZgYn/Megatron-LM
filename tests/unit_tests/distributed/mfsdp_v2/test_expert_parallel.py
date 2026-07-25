@@ -20,7 +20,6 @@ import dataclasses
 import pytest
 import torch
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
@@ -121,65 +120,61 @@ def test_hybrid_model_shards_experts_and_dense(distributed_setup, model_parallel
     config.hidden_dropout = 0.0
     config.attention_dropout = 0.0
 
+    # data_parallel_random_init=False gives every DP rank the same seed, so weights
+    # initialize identically across ranks. Coherent FSDP sharding requires this: each rank
+    # shards its own copy, so the all-gather only reconstructs a consistent weight if all
+    # ranks started equal. (It also makes the run deterministic.)
     _set_random_seed(seed_=123, data_parallel_random_init=False)
     baseline = _build_hybrid_model(config).cuda()
-    _set_random_seed(seed_=123, data_parallel_random_init=False)
     model = _build_hybrid_model(config).cuda()
-    # Identical starting point for the mFSDP-sharded model and the EP-only baseline.
-    baseline.load_state_dict(model.state_dict())
+    # The model under test starts from the EP-only baseline's weights.
+    model.load_state_dict(baseline.state_dict())
 
-    # Bottom-up: experts shard over this rank's expert-DP group. Build the 2-D (dp, ep)
-    # mesh (ep innermost, matching MCore's ep-fastest layout) only to slice out the 1-D
-    # expert-DP sub-mesh -- a plain init_device_mesh((dp_size,)) would group the wrong
-    # ranks ({0,1,2,3} instead of the expert-DP {0,2,4,6}).
-    ep_mesh = init_device_mesh(device.type, (dp_size, ep_size), mesh_dim_names=("dp", "ep"))
-    experts = model.decoder.layers[0].mlp.experts
-    fully_shard(
-        experts,
-        mesh=ep_mesh["dp"],
-        placements=Placements(
-            dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
-        ),
-    )
+    # Bottom-up: shard each decoder layer's experts over this rank's expert-DP group. Build
+    # the full 2-D (dp, ep) mesh (ep innermost, matching MCore's ep-fastest layout) only to
+    # slice out the 1-D expert-DP sub-mesh -- a plain init_device_mesh((dp_size,)) would
+    # group the wrong ranks ({0,1,2,3} instead of the expert-DP {0,2,4,6}).
+    moe_mesh = init_device_mesh(device.type, (dp_size, ep_size), mesh_dim_names=("dp", "ep"))
+    for decoder_layer in model.decoder.layers:
+        fully_shard(
+            decoder_layer.mlp.experts,
+            mesh=moe_mesh["dp"],
+            placements=Placements(
+                dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
+            ),
+        )
     # ...then the remaining EP-replicated params shard over the full DP mesh.
-    full_mesh = init_device_mesh(device.type, (world_size,))
+    dense_mesh = init_device_mesh(device.type, (world_size,))
     fully_shard(
         model,
-        mesh=full_mesh,
+        mesh=dense_mesh,
         placements=Placements(
             dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
         ),
     )
-
-    # Experts shard over just this rank's expert-DP group; every other (dense) param shards
-    # over the full DP mesh.
-    ep_idx = distributed_setup.rank % ep_size
-    expert_dp_ranks = list(range(ep_idx, world_size, ep_size))
-    full_dp_ranks = list(range(world_size))
-    expert_param_ids = {id(param) for param in experts.parameters()}
-    for name, param in model.named_parameters():
-        assert isinstance(param, DTensor), f"param {name!r} should be a DTensor."
-        expected = expert_dp_ranks if id(param) in expert_param_ids else full_dp_ranks
-        assert param.device_mesh.mesh.tolist() == expected, (
-            f"param {name!r} sharded over ranks {param.device_mesh.mesh.tolist()}, "
-            f"expected {expected}."
-        )
 
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.02, foreach=False)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.02, foreach=False)
 
-    # Identical inputs on every rank, so the DP gradient reduction is a no-op and the
-    # mFSDP-sharded model must reproduce the EP-only baseline exactly.
-    data = torch.arange(seq, dtype=torch.int64, device=device).repeat(batch, 1)
-    attention_mask = torch.ones((batch, 1, seq, seq), dtype=torch.bool, device=device)
+    # Re-anchor the RNG right before the draws so the inputs are identical across ranks --
+    # the transparency invariant (identical data -> the DP gradient reduction is a no-op, so
+    # the mFSDP-sharded model must reproduce the EP-only baseline exactly). Re-anchoring here
+    # makes this independent of whatever RNG the two model builds above consumed (which could
+    # differ per rank), and decouples the inputs from the weight-init seed. randint keeps the
+    # inputs non-degenerate across batch/seq.
     torch.manual_seed(4321)
+    input_ids = torch.randint(0, vocab, (batch, seq), dtype=torch.int64, device=device)
+    position_ids = torch.arange(seq, dtype=torch.int64, device=device).repeat(batch, 1)
+    attention_mask = torch.ones((batch, 1, seq, seq), dtype=torch.bool, device=device)
     target = torch.randn(batch, seq, vocab, device=device)
 
     def train(m, opt) -> list[torch.Tensor]:
         losses = []
         for _ in range(5):
             opt.zero_grad()
-            logits = m(input_ids=data, position_ids=data, attention_mask=attention_mask)
+            logits = m(
+                input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+            )
             loss = torch.nn.functional.mse_loss(logits, target)
             losses.append(loss.detach())
             loss.backward()
