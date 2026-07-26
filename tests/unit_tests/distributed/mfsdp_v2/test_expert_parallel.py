@@ -3,21 +3,19 @@
 """Megatron-FSDP v2 composed with expert parallelism through a real MCore HybridModel.
 
 Checks that an ``EP=2`` MoE ``HybridModel`` sharded with mFSDP v2 (experts over the
-expert-DP sub-mesh, the remaining dense params over the full DP mesh), consuming its
-``1/dp`` shard of a global batch, reproduces the same training as a single **full-batch
-``EP=1`` reference**.
+expert-DP sub-mesh, dense params over the full DP mesh), consuming its ``1/dp`` shard of a
+global batch, reproduces a single **full-batch ``EP=1`` reference**.
 
-The reference processes the **whole** global batch on every rank, so its gradients are
+The reference processes the whole global batch on every rank, so its gradients are
 identical across ranks and need no reduction -- it has no distributed logic. The model's
-gradients are reduced only by mFSDP. So this is an independent check of EP all-to-all
+gradients are reduced only by mFSDP. So this independently validates EP all-to-all
 dispatch, FSDP sharding, and the gradient reduction/scaling: a broken reduction (or a
 missing expert-grad scaling factor) would diverge from full-batch training.
 
 Both models are built from explicit ``ProcessGroupCollection``s (no global
 ``parallel_state`` / ``initialize_model_parallel``): the reference with a size-1 ``ep``
-group (all experts local) and the model with the 2-way ``ep`` group.
-
-Model shapes and the ``(ep, dp)`` split are test-local so different tests can vary them.
+group (all experts local), the model with the 2-way ``ep`` group. Model shapes and the
+``(ep, dp)`` split are test-local so different tests can vary them.
 """
 
 import pytest
@@ -36,8 +34,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+_FLAT_SHARD = Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
-def _config(num_experts, ep_size, hidden, ffn):
+
+def _transformer_config(num_experts, ep_size, hidden, ffn_hidden):
     return TransformerConfig(
         num_layers=1,
         hidden_size=hidden,
@@ -48,7 +48,7 @@ def _config(num_experts, ep_size, hidden, ffn):
         moe_router_topk=2,
         moe_aux_loss_coeff=0.0,
         moe_grouped_gemm=True,
-        moe_ffn_hidden_size=ffn,
+        moe_ffn_hidden_size=ffn_hidden,
         add_bias_linear=False,
         gradient_accumulation_fusion=False,
         use_cpu_initialization=True,
@@ -59,7 +59,7 @@ def _config(num_experts, ep_size, hidden, ffn):
     )
 
 
-def _pgc(one, world, ep, expt_dp):
+def _process_group_collection(one, world, ep, expt_dp):
     """A ProcessGroupCollection for a TP=PP=CP=1 MoE model with the given ep/expert-dp."""
     return ProcessGroupCollection(
         tp=one,
@@ -78,7 +78,7 @@ def _pgc(one, world, ep, expt_dp):
     )
 
 
-def _build(config, pgc, vocab, seq):
+def _build_hybrid_model(config, pgc, vocab, seq):
     return HybridModel(
         config=config,
         hybrid_stack_spec=hybrid_stack_spec,
@@ -89,130 +89,93 @@ def _build(config, pgc, vocab, seq):
     ).cuda()
 
 
+def _train(model, ids, pos, mask, target, reduce_group=None):
+    """Run 5 SGD steps; return the per-step losses (globally averaged if reduce_group given)."""
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.02, foreach=False)
+    losses = []
+    for _ in range(5):
+        optimizer.zero_grad()
+        loss = torch.nn.functional.mse_loss(
+            model(input_ids=ids, position_ids=pos, attention_mask=mask), target
+        )
+        recorded = loss.detach().clone()
+        if reduce_group is not None:  # recover the global (full-batch) loss
+            dist.all_reduce(recorded, op=dist.ReduceOp.AVG, group=reduce_group)
+        losses.append(recorded)
+        loss.backward()
+        optimizer.step()
+    return losses
+
+
 def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
     """EP=2 + mFSDP on 1/dp-sharded data reproduces single full-batch EP=1 training."""
     device = distributed_setup.device
-    dev = device.type
-    world_size = distributed_setup.world_size
-    rank = distributed_setup.rank
+    world_size, rank = distributed_setup.world_size, distributed_setup.rank
 
     num_experts, ep_size = 8, 2
-    hidden, ffn = 16, 64
-    vocab, seq, b_local = 128, 8, 2
+    hidden, ffn_hidden, vocab, seq, b_local = 16, 64, 128, 8, 2
     if world_size % ep_size != 0 or num_experts % ep_size != 0:
         pytest.skip(f"world_size {world_size} is incompatible with EP={ep_size}.")
     dp_size = world_size // ep_size
-    global_batch = world_size * b_local  # split one shard per rank
+    global_batch = world_size * b_local  # one shard per rank
 
-    # Process groups, all derived from device meshes (no global parallel_state):
-    #   one     -> size-1 groups (TP=PP=CP=1, and the EP=1 reference's ep group)
-    #   world   -> the full DP group (dense + EP=1 expert-DP)
-    #   moe_mesh-> ep (ep_size-way) and expert-DP (dp_size-way) groups for the EP=2 model
-    one = init_device_mesh(dev, (world_size, 1), mesh_dim_names=("w", "one"))["one"].get_group()
-    world = init_device_mesh(dev, (world_size,)).get_group()
-    moe_mesh = init_device_mesh(dev, (dp_size, ep_size), mesh_dim_names=("dp", "ep"))
+    # Process groups from device meshes (no global parallel_state). one -> size-1 groups
+    # (TP=PP=CP=1 and the EP=1 reference's ep group); world_mesh -> the full DP group.
+    one = init_device_mesh(device.type, (world_size, 1), mesh_dim_names=("w", "one"))["one"].get_group()
+    world_mesh = init_device_mesh(device.type, (world_size,))
+    moe_mesh = init_device_mesh(device.type, (dp_size, ep_size), mesh_dim_names=("dp", "ep"))
+    world = world_mesh.get_group()
     ep_grp, expt_dp_grp = moe_mesh["ep"].get_group(), moe_mesh["dp"].get_group()
 
-    # Reference: EP=1 (all num_experts local). Model: EP=2 (num_experts/EP local per rank).
-    # Same seed + use_cpu_initialization => weights are identical across ranks.
+    # Reference EP=1 (all experts local); model EP=2. Same seed + CPU init => identical weights.
     torch.manual_seed(123)
-    reference = _build(_config(num_experts, 1, hidden, ffn), _pgc(one, world, one, world), vocab, seq)
+    reference = _build_hybrid_model(
+        _transformer_config(num_experts, 1, hidden, ffn_hidden),
+        _process_group_collection(one, world, one, world),
+        vocab,
+        seq,
+    )
     torch.manual_seed(123)
-    model = _build(
-        _config(num_experts, ep_size, hidden, ffn),
-        _pgc(one, world, ep_grp, expt_dp_grp),
+    model = _build_hybrid_model(
+        _transformer_config(num_experts, ep_size, hidden, ffn_hidden),
+        _process_group_collection(one, world, ep_grp, expt_dp_grp),
         vocab,
         seq,
     )
 
-    # Align model weights to the reference: dense params directly; expert params by their
-    # GLOBAL index (the model's local weight i is global expert local_expert_indices[i]).
-    reference_params = dict(reference.named_parameters())
-    for name, param in model.named_parameters():
-        if ".experts." not in name:
-            param.data.copy_(reference_params[name].data)
-    moe = model.decoder.layers[0].mlp
-    reference_experts = reference.decoder.layers[0].mlp.experts
-    for fc in ("linear_fc1", "linear_fc2"):
-        reference_fc, model_fc = getattr(reference_experts, fc), getattr(moe.experts, fc)
-        for local, global_ in enumerate(moe.local_expert_indices):
-            getattr(model_fc, f"weight{local}").data.copy_(
-                getattr(reference_fc, f"weight{global_}").data
-            )
+    # Dense params line up by name (load_state_dict); the experts do not -- EP=1 stores all
+    # experts as weight0.., EP=2 stores num_experts/EP as weight0.. per rank -- so patch them
+    # by global index (model local weight i == reference global weight local_expert_indices[i]).
+    model.load_state_dict(reference.state_dict(), strict=False)
+    for model_layer, reference_layer in zip(model.decoder.layers, reference.decoder.layers):
+        for fc in ("linear_fc1", "linear_fc2"):
+            model_fc = getattr(model_layer.mlp.experts, fc)
+            reference_fc = getattr(reference_layer.mlp.experts, fc)
+            for local, global_ in enumerate(model_layer.mlp.local_expert_indices):
+                getattr(model_fc, f"weight{local}").data.copy_(
+                    getattr(reference_fc, f"weight{global_}").data
+                )
 
     # Shard the model: experts over the expert-DP sub-mesh, dense params over the full DP mesh.
     for decoder_layer in model.decoder.layers:
-        fully_shard(
-            decoder_layer.mlp.experts,
-            mesh=moe_mesh["dp"],
-            placements=Placements(
-                dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
-            ),
-        )
-    dense_mesh = init_device_mesh(dev, (world_size,))
-    fully_shard(
-        model,
-        mesh=dense_mesh,
-        placements=Placements(
-            dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
-        ),
-    )
+        fully_shard(decoder_layer.mlp.experts, mesh=moe_mesh["dp"], placements=_FLAT_SHARD)
+    fully_shard(model, mesh=world_mesh, placements=_FLAT_SHARD)
 
-    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.02, foreach=False)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.02, foreach=False)
-
-    # One global batch, identical on every rank (same seed). The reference consumes the whole
-    # batch; the model consumes its 1/dp shard.
+    # One global batch, identical on every rank; the reference sees all of it, the model its shard.
     torch.manual_seed(4321)
-    input_ids = torch.randint(0, vocab, (global_batch, seq), dtype=torch.int64, device=device)
-    position_ids = torch.arange(seq, dtype=torch.int64, device=device).repeat(global_batch, 1)
-    attention_mask = torch.ones((global_batch, 1, seq, seq), dtype=torch.bool, device=device)
+    ids = torch.randint(0, vocab, (global_batch, seq), dtype=torch.int64, device=device)
+    pos = torch.arange(seq, dtype=torch.int64, device=device).repeat(global_batch, 1)
+    mask = torch.ones((global_batch, 1, seq, seq), dtype=torch.bool, device=device)
     target = torch.randn(global_batch, seq, vocab, device=device)
     shard = slice(rank * b_local, (rank + 1) * b_local)
 
-    def train_reference():
-        # Full batch on every rank -> identical grads across ranks, so no reduction is
-        # needed. A plain single-model reference with no distributed logic.
-        losses = []
-        for _ in range(5):
-            reference_optimizer.zero_grad()
-            loss = torch.nn.functional.mse_loss(
-                reference(input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask),
-                target,
-            )
-            losses.append(loss.detach())
-            loss.backward()
-            reference_optimizer.step()
-        return losses
+    reference_losses = _train(reference, ids, pos, mask, target)
+    model_losses = _train(model, ids[shard], pos[shard], mask[shard], target[shard], reduce_group=world)
 
-    def train_model():
-        # The model trains on its 1/dp shard; mFSDP reduces the gradients. All-reduce only
-        # the loss (AVG) to recover the global full-batch loss for the comparison.
-        losses = []
-        for _ in range(5):
-            optimizer.zero_grad()
-            loss = torch.nn.functional.mse_loss(
-                model(
-                    input_ids=input_ids[shard],
-                    position_ids=position_ids[shard],
-                    attention_mask=attention_mask[shard],
-                ),
-                target[shard],
-            )
-            global_loss = loss.detach().clone()
-            dist.all_reduce(global_loss, op=dist.ReduceOp.AVG, group=world)
-            losses.append(global_loss)
-            loss.backward()
-            optimizer.step()
-        return losses
-
-    reference_losses = train_reference()
-    sharded_losses = train_model()
-
-    # rtol dominates the tolerance; the residual drift is benign EP-path numerics (alltoall
-    # token reordering + grouped-GEMM over num_experts/EP vs all experts), ~2e-5 at 5 steps.
+    # rtol dominates; the residual ~2e-5 drift is benign EP-path numerics (alltoall token
+    # reordering + grouped-GEMM over num_experts/EP vs all experts).
     torch.testing.assert_close(
-        torch.stack(sharded_losses),
+        torch.stack(model_losses),
         torch.stack(reference_losses),
         rtol=1e-3,
         atol=1e-4,
