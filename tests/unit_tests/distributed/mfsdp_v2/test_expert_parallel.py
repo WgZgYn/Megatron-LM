@@ -59,7 +59,7 @@ def _transformer_config(num_experts, ep_size, hidden, ffn_hidden):
     )
 
 
-def _process_group_collection(one, world, ep, expt_dp):
+def _process_group_collection(one, world, ep, expert_dp):
     """A ProcessGroupCollection for a TP=PP=CP=1 MoE model with the given ep/expert-dp."""
     return ProcessGroupCollection(
         tp=one,
@@ -70,7 +70,7 @@ def _process_group_collection(one, world, ep, expt_dp):
         tp_dp_cp=world,
         ep=ep,
         tp_ep=ep,
-        expt_dp=expt_dp,
+        expt_dp=expert_dp,
         dp=world,
         dp_cp=world,
         embd=None,
@@ -78,19 +78,19 @@ def _process_group_collection(one, world, ep, expt_dp):
     )
 
 
-def _build_hybrid_model(config, pgc, vocab, seq):
+def _build_hybrid_model(config, pg_collection, vocab, seq):
     return HybridModel(
         config=config,
         hybrid_stack_spec=hybrid_stack_spec,
         vocab_size=vocab,
         max_sequence_length=seq,
         hybrid_layer_pattern="E",
-        pg_collection=pgc,
+        pg_collection=pg_collection,
     ).cuda()
 
 
-def _train(model, ids, pos, mask, target, reduce_group=None):
-    """Run 5 SGD steps; return the per-step losses (globally averaged if reduce_group given)."""
+def _train(model, ids, pos, mask, target, loss_reduce_group=None):
+    """Run 5 SGD steps; return the per-step losses (globally averaged if loss_reduce_group given)."""
     optimizer = torch.optim.SGD(model.parameters(), lr=0.02, foreach=False)
     losses = []
     for _ in range(5):
@@ -102,8 +102,8 @@ def _train(model, ids, pos, mask, target, reduce_group=None):
         optimizer.step()
         # The model sees a shard, so average the loss across ranks for the global loss.
         loss = loss.detach()
-        if reduce_group is not None:
-            dist.all_reduce(loss, op=dist.ReduceOp.AVG, group=reduce_group)
+        if loss_reduce_group is not None:
+            dist.all_reduce(loss, op=dist.ReduceOp.AVG, group=loss_reduce_group)
         losses.append(loss)
     return losses
 
@@ -120,15 +120,19 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
     dp_size = world_size // ep_size
     global_batch = world_size * b_local  # one shard per rank
 
-    # Process groups from device meshes (no global parallel_state). one -> size-1 groups
-    # (TP=PP=CP=1 and the EP=1 reference's ep group); world_mesh -> the full DP group.
-    one = init_device_mesh(device.type, (world_size, 1), mesh_dim_names=("w", "one"))["one"].get_group()
+    # Process groups (no global parallel_state). world_mesh: the full DP group; moe_mesh: the
+    # ep (ep_size-way) and expert-DP (dp_size-way) groups for the EP=2 model. Meshes also
+    # initialize the default process group, so build them before the size-1 group below.
     world_mesh = init_device_mesh(device.type, (world_size,))
-    moe_mesh = init_device_mesh(device.type, (dp_size, ep_size), mesh_dim_names=("dp", "ep"))
     world = world_mesh.get_group()
-    ep_grp, expt_dp_grp = moe_mesh["ep"].get_group(), moe_mesh["dp"].get_group()
+    moe_mesh = init_device_mesh(device.type, (dp_size, ep_size), mesh_dim_names=("dp", "ep"))
+    ep_group, expert_dp_group = moe_mesh.get_group("ep"), moe_mesh.get_group("dp")
+    # This rank's size-1 group: the trivial TP=PP=CP axes and the EP=1 reference's ep group.
+    one = dist.new_group([rank], use_local_synchronization=True)
 
-    # Reference EP=1 (all experts local); model EP=2. Same seed + CPU init => identical weights.
+    # Reference EP=1 (all experts local); model EP=2. Seed once so the reference is
+    # deterministic and identical across ranks (CPU init); the model's own init is irrelevant
+    # since its weights are copied from the reference below.
     torch.manual_seed(123)
     reference = _build_hybrid_model(
         _transformer_config(num_experts, 1, hidden, ffn_hidden),
@@ -136,10 +140,9 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
         vocab,
         seq,
     )
-    torch.manual_seed(123)
     model = _build_hybrid_model(
         _transformer_config(num_experts, ep_size, hidden, ffn_hidden),
-        _process_group_collection(one, world, ep_grp, expt_dp_grp),
+        _process_group_collection(one, world, ep_group, expert_dp_group),
         vocab,
         seq,
     )
@@ -171,7 +174,7 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
     shard = slice(rank * b_local, (rank + 1) * b_local)
 
     reference_losses = _train(reference, ids, pos, mask, target)
-    model_losses = _train(model, ids[shard], pos[shard], mask[shard], target[shard], reduce_group=world)
+    model_losses = _train(model, ids[shard], pos[shard], mask[shard], target[shard], loss_reduce_group=world)
 
     # rtol dominates; the residual ~2e-5 drift is benign EP-path numerics (alltoall token
     # reordering + grouped-GEMM over num_experts/EP vs all experts).
@@ -179,6 +182,10 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
         torch.stack(model_losses),
         torch.stack(reference_losses),
         rtol=1e-3,
-        atol=1e-4,
+        atol=0,
         msg="EP=2 mFSDP model did not reproduce full-batch EP=1 training.",
     )
+
+    # Destroy the groups this test created; leave the default (world) group for later tests.
+    for group in (one, ep_group, expert_dp_group):
+        dist.destroy_process_group(group)
