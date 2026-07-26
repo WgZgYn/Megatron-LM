@@ -98,12 +98,13 @@ def _train(model, ids, pos, mask, target, reduce_group=None):
         loss = torch.nn.functional.mse_loss(
             model(input_ids=ids, position_ids=pos, attention_mask=mask), target
         )
-        recorded = loss.detach().clone()
-        if reduce_group is not None:  # recover the global (full-batch) loss
-            dist.all_reduce(recorded, op=dist.ReduceOp.AVG, group=reduce_group)
-        losses.append(recorded)
         loss.backward()
         optimizer.step()
+        # The model sees a shard, so average the loss across ranks for the global loss.
+        loss = loss.detach()
+        if reduce_group is not None:
+            dist.all_reduce(loss, op=dist.ReduceOp.AVG, group=reduce_group)
+        losses.append(loss)
     return losses
 
 
