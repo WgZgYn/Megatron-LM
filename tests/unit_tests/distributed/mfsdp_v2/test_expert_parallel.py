@@ -59,20 +59,23 @@ def _transformer_config(num_experts, ep_size, hidden, ffn_hidden):
     )
 
 
-def _process_group_collection(one, world, ep, expert_dp):
-    """A ProcessGroupCollection for a TP=PP=CP=1 MoE model with the given ep/expert-dp."""
+def _build_process_group_collection(one, dp, ep, expert_dp):
+    """A ProcessGroupCollection for a TP=PP=CP=1 MoE model. `one` is a size-1 group for the
+    trivial TP/PP/CP axes; dp, ep, expert_dp are the data-, expert-, and expert-data-parallel
+    groups.
+    """
     return ProcessGroupCollection(
         tp=one,
         expt_tp=one,
         cp=one,
         pp=one,
         tp_cp=one,
-        tp_dp_cp=world,
+        tp_dp_cp=dp,
         ep=ep,
         tp_ep=ep,
         expt_dp=expert_dp,
-        dp=world,
-        dp_cp=world,
+        dp=dp,
+        dp_cp=dp,
         embd=None,
         pos_embd=None,
     )
@@ -136,13 +139,13 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
     torch.manual_seed(123)
     reference = _build_hybrid_model(
         _transformer_config(num_experts, 1, hidden, ffn_hidden),
-        _process_group_collection(one, world, one, world),
+        _build_process_group_collection(one, dp=one, ep=one, expert_dp=one),
         vocab,
         seq,
     )
     model = _build_hybrid_model(
         _transformer_config(num_experts, ep_size, hidden, ffn_hidden),
-        _process_group_collection(one, world, ep_group, expert_dp_group),
+        _build_process_group_collection(one, dp=world, ep=ep_group, expert_dp=expert_dp_group),
         vocab,
         seq,
     )
