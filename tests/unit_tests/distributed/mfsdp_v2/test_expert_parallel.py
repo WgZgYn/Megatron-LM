@@ -177,7 +177,9 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
     shard = slice(rank * b_local, (rank + 1) * b_local)
 
     reference_losses = _train(reference, ids, pos, mask, target)
-    model_losses = _train(model, ids[shard], pos[shard], mask[shard], target[shard], loss_reduce_group=world)
+    model_losses = _train(
+        model, ids[shard], pos[shard], mask[shard], target[shard], loss_reduce_group=world
+    )
 
     # rtol dominates; the residual ~2e-5 drift is benign EP-path numerics (alltoall token
     # reordering + grouped-GEMM over num_experts/EP vs all experts).
