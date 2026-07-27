@@ -39,7 +39,9 @@ from megatron.core.transformer.transformer_layer import MoETransformerLayer
 _FLAT_SHARD = Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
 
-def _transformer_config(num_layers, num_experts, ep_size, hidden, ffn_hidden):
+def _transformer_config(
+    num_layers: int, num_experts: int, ep_size: int, hidden: int, ffn_hidden: int
+) -> TransformerConfig:
     return TransformerConfig(
         num_layers=num_layers,
         hidden_size=hidden,
@@ -62,7 +64,12 @@ def _transformer_config(num_layers, num_experts, ep_size, hidden, ffn_hidden):
     )
 
 
-def _build_process_group_collection(one, dp, ep, expert_dp):
+def _build_process_group_collection(
+    one: dist.ProcessGroup,
+    dp: dist.ProcessGroup,
+    ep: dist.ProcessGroup,
+    expert_dp: dist.ProcessGroup,
+) -> ProcessGroupCollection:
     """A ProcessGroupCollection for a TP=PP=CP=1 MoE model. `one` is a size-1 group for the
     trivial TP/PP/CP axes; dp, ep, expert_dp are the data-, expert-, and expert-data-parallel
     groups.
@@ -84,7 +91,13 @@ def _build_process_group_collection(one, dp, ep, expert_dp):
     )
 
 
-def _build_hybrid_model(config, pg_collection, vocab, seq, pattern):
+def _build_hybrid_model(
+    config: TransformerConfig,
+    pg_collection: ProcessGroupCollection,
+    vocab: int,
+    seq: int,
+    pattern: str,
+) -> HybridModel:
     return HybridModel(
         config=config,
         hybrid_stack_spec=hybrid_stack_spec,
@@ -95,7 +108,14 @@ def _build_hybrid_model(config, pg_collection, vocab, seq, pattern):
     ).cuda()
 
 
-def _train(model, ids, pos, mask, target, loss_reduce_group=None):
+def _train(
+    model: torch.nn.Module,
+    ids: torch.Tensor,
+    pos: torch.Tensor,
+    mask: torch.Tensor | None,
+    target: torch.Tensor,
+    loss_reduce_group: dist.ProcessGroup | None = None,
+) -> list[torch.Tensor]:
     """Run 5 SGD steps; return the per-step losses (globally averaged if loss_reduce_group given)."""
     optimizer = torch.optim.SGD(model.parameters(), lr=0.02, foreach=False)
     losses = []
