@@ -2,9 +2,10 @@
 
 """Megatron-FSDP v2 composed with expert parallelism through a real MCore HybridModel.
 
-Checks that an ``EP=2`` MoE ``HybridModel`` sharded with mFSDP v2 (experts over the
-expert-DP sub-mesh, dense params over the full DP mesh), consuming its ``1/dp`` shard of a
-global batch, reproduces a single **full-batch ``EP=1`` reference**.
+Checks that an ``EP=2`` transformer-MoE ``HybridModel`` (an attention layer + a MoE layer)
+sharded with mFSDP v2 (experts over the expert-DP sub-mesh, dense params over the full DP
+mesh), consuming its ``1/dp`` shard of a global batch, reproduces a single **full-batch
+``EP=1`` reference**.
 
 The reference processes the whole global batch on every rank, so its gradients are
 identical across ranks and need no reduction -- it has no distributed logic. The model's
@@ -33,13 +34,14 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import MoETransformerLayer
 
 _FLAT_SHARD = Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
 
-def _transformer_config(num_experts, ep_size, hidden, ffn_hidden):
+def _transformer_config(num_layers, num_experts, ep_size, hidden, ffn_hidden):
     return TransformerConfig(
-        num_layers=1,
+        num_layers=num_layers,
         hidden_size=hidden,
         num_attention_heads=4,
         num_moe_experts=num_experts,
@@ -55,7 +57,8 @@ def _transformer_config(num_experts, ep_size, hidden, ffn_hidden):
         params_dtype=torch.float32,
         hidden_dropout=0.0,
         attention_dropout=0.0,
-        attention_backend=AttnBackend.local,
+        # unfused (native-PyTorch) attention: flash/fused don't support the fp32 params we use.
+        attention_backend=AttnBackend.unfused,
     )
 
 
@@ -81,13 +84,13 @@ def _build_process_group_collection(one, dp, ep, expert_dp):
     )
 
 
-def _build_hybrid_model(config, pg_collection, vocab, seq):
+def _build_hybrid_model(config, pg_collection, vocab, seq, pattern):
     return HybridModel(
         config=config,
         hybrid_stack_spec=hybrid_stack_spec,
         vocab_size=vocab,
         max_sequence_length=seq,
-        hybrid_layer_pattern="E",
+        hybrid_layer_pattern=pattern,
         pg_collection=pg_collection,
     ).cuda()
 
@@ -117,7 +120,14 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
     world_size, rank = distributed_setup.world_size, distributed_setup.rank
 
     num_experts, ep_size = 8, 2
-    hidden, ffn_hidden, vocab, seq, b_local = 16, 64, 128, 8, 2
+    # hidden=64 with 4 heads -> head_dim=16, large enough for the attention backend.
+    hidden, ffn_hidden, vocab, seq, b_local = 64, 128, 128, 8, 2
+    # HybridModel builds one layer per pattern symbol, so "*E" is a two-layer stack: "*" a
+    # self-attention-only layer, "E" a MoE layer -- i.e. a real transformer-MoE block
+    # (attention then MoE, two residuals; equivalent to a Mixtral-style layer). This exercises
+    # mFSDP sharding the dense attention params over full DP alongside EP-sharded experts.
+    layer_pattern = "*E"
+    num_layers = len(layer_pattern)
     if world_size % ep_size != 0 or num_experts % ep_size != 0:
         pytest.skip(f"world_size {world_size} is incompatible with EP={ep_size}.")
     dp_size = world_size // ep_size
@@ -138,16 +148,18 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
     # since its weights are copied from the reference below.
     torch.manual_seed(123)
     reference = _build_hybrid_model(
-        _transformer_config(num_experts, 1, hidden, ffn_hidden),
+        _transformer_config(num_layers, num_experts, 1, hidden, ffn_hidden),
         _build_process_group_collection(one, dp=one, ep=one, expert_dp=one),
         vocab,
         seq,
+        layer_pattern,
     )
     model = _build_hybrid_model(
-        _transformer_config(num_experts, ep_size, hidden, ffn_hidden),
+        _transformer_config(num_layers, num_experts, ep_size, hidden, ffn_hidden),
         _build_process_group_collection(one, dp=world, ep=ep_group, expert_dp=expert_dp_group),
         vocab,
         seq,
+        layer_pattern,
     )
 
     # Dense params line up by name (load_state_dict); the experts do not -- EP=1 stores all
@@ -155,6 +167,8 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
     # by global index (model local weight i == reference global weight local_expert_indices[i]).
     model.load_state_dict(reference.state_dict(), strict=False)
     for model_layer, reference_layer in zip(model.decoder.layers, reference.decoder.layers):
+        if not isinstance(model_layer, MoETransformerLayer):
+            continue  # only MoE layers have experts to remap; the attention layer has none
         for fc in ("linear_fc1", "linear_fc2"):
             model_fc = getattr(model_layer.mlp.experts, fc)
             reference_fc = getattr(reference_layer.mlp.experts, fc)
@@ -165,20 +179,21 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
 
     # Shard the model: experts over the expert-DP sub-mesh, dense params over the full DP mesh.
     for decoder_layer in model.decoder.layers:
-        fully_shard(decoder_layer.mlp.experts, mesh=moe_mesh["dp"], placements=_FLAT_SHARD)
+        if isinstance(decoder_layer, MoETransformerLayer):
+            fully_shard(decoder_layer.mlp.experts, mesh=moe_mesh["dp"], placements=_FLAT_SHARD)
     fully_shard(model, mesh=world_mesh, placements=_FLAT_SHARD)
 
     # One global batch, identical on every rank; the reference sees all of it, the model its shard.
     torch.manual_seed(4321)
     ids = torch.randint(0, vocab, (global_batch, seq), dtype=torch.int64, device=device)
     pos = torch.arange(seq, dtype=torch.int64, device=device).repeat(global_batch, 1)
-    mask = torch.ones((global_batch, 1, seq, seq), dtype=torch.bool, device=device)
+    mask = None  # attention layer is attn_mask_type=causal, so TE builds the causal mask itself
     target = torch.randn(global_batch, seq, vocab, device=device)
     shard = slice(rank * b_local, (rank + 1) * b_local)
 
     reference_losses = _train(reference, ids, pos, mask, target)
     model_losses = _train(
-        model, ids[shard], pos[shard], mask[shard], target[shard], loss_reduce_group=world
+        model, ids[shard], pos[shard], mask, target[shard], loss_reduce_group=world
     )
 
     # rtol dominates; the residual ~2e-5 drift is benign EP-path numerics (alltoall token
