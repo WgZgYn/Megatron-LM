@@ -198,9 +198,15 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
                 )
 
     # Shard the model: experts over the expert-DP sub-mesh, dense params over the full DP mesh.
+    # Experts additionally need grad_divisor=ep_size; see fully_shard.
     for decoder_layer in model.decoder.layers:
         if isinstance(decoder_layer, MoETransformerLayer):
-            fully_shard(decoder_layer.mlp.experts, mesh=moe_mesh["dp"], placements=_FLAT_SHARD)
+            fully_shard(
+                decoder_layer.mlp.experts,
+                mesh=moe_mesh["dp"],
+                placements=_FLAT_SHARD,
+                grad_divisor=ep_size,
+            )
     fully_shard(model, mesh=world_mesh, placements=_FLAT_SHARD)
 
     # One global batch, identical on every rank; the reference sees all of it, the model its shard.
@@ -216,13 +222,9 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
         model, ids[shard], pos[shard], mask, target[shard], loss_reduce_group=world
     )
 
-    # rtol dominates; the residual ~2e-5 drift is benign EP-path numerics (alltoall token
-    # reordering + grouped-GEMM over num_experts/EP vs all experts).
     torch.testing.assert_close(
         torch.stack(model_losses),
         torch.stack(reference_losses),
-        rtol=1e-3,
-        atol=0,
         msg="EP=2 mFSDP model did not reproduce full-batch EP=1 training.",
     )
 

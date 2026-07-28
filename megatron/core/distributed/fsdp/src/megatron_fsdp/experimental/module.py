@@ -98,6 +98,7 @@ class FsdpModule:
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
         use_symm_mem: bool = False,
+        grad_divisor: int = 1,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = None
@@ -108,6 +109,8 @@ class FsdpModule:
         assert axis_indices == tuple(
             range(mesh.ndim)
         ), "FSDP requires dp_axes to match every mesh axis in mesh order for now."
+        if grad_divisor <= 0:
+            raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
         parameter_groups = [
             FsdpParameterGroup(
                 owning_module=self,
@@ -116,6 +119,7 @@ class FsdpModule:
                 placements=placements,
                 mixed_precision_policy=mixed_precision_policy,
                 use_symm_mem=use_symm_mem,
+                grad_divisor=grad_divisor,
             )
             for group_parameters in _group_parameters(owned_parameters)
         ]
