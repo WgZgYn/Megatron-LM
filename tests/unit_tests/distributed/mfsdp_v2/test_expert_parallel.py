@@ -2,7 +2,7 @@
 
 """Megatron-FSDP v2 composed with expert parallelism through a real MCore HybridModel.
 
-Checks that an ``EP=2`` transformer-MoE ``HybridModel`` (an attention layer + a MoE layer)
+Checks that an ``EP=4`` transformer-MoE ``HybridModel`` (an attention layer + a MoE layer)
 sharded with mFSDP v2 (experts over the expert-DP sub-mesh, dense params over the full DP
 mesh), consuming its ``1/dp`` shard of a global batch, reproduces a single **full-batch
 ``EP=1`` reference**.
@@ -135,11 +135,11 @@ def _train(
 
 
 def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
-    """EP=2 + mFSDP on 1/dp-sharded data reproduces single full-batch EP=1 training."""
+    """EP=4 + mFSDP on 1/dp-sharded data reproduces single full-batch EP=1 training."""
     device = distributed_setup.device
     world_size, rank = distributed_setup.world_size, distributed_setup.rank
 
-    num_experts, ep_size = 8, 2
+    num_experts, ep_size = 8, 4
     # hidden=64 with 4 heads -> head_dim=16, large enough for the attention backend.
     hidden, ffn_hidden, vocab, seq, b_local = 64, 128, 128, 8, 2
     # HybridModel builds one layer per pattern symbol, so "*E" is a two-layer stack: "*" a
@@ -154,7 +154,7 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
     global_batch = world_size * b_local  # one shard per rank
 
     # Process groups (no global parallel_state). world_mesh: the full DP group; moe_mesh: the
-    # ep (ep_size-way) and expert-DP (dp_size-way) groups for the EP=2 model. Meshes also
+    # ep (ep_size-way) and expert-DP (dp_size-way) groups for the EP=4 model. Meshes also
     # initialize the default process group, so build them before the size-1 group below.
     world_mesh = init_device_mesh(device.type, (world_size,))
     world = world_mesh.get_group()
@@ -163,7 +163,7 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
     # This rank's size-1 group: the trivial TP=PP=CP axes and the EP=1 reference's ep group.
     one = dist.new_group([rank], use_local_synchronization=True)
 
-    # Reference EP=1 (all experts local); model EP=2. Seed once so the reference is
+    # Reference EP=1 (all experts local); model EP=4. Seed once so the reference is
     # deterministic and identical across ranks (CPU init); the model's own init is irrelevant
     # since its weights are copied from the reference below.
     torch.manual_seed(123)
@@ -183,7 +183,7 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
     )
 
     # Dense params line up by name (load_state_dict); the experts do not -- EP=1 stores all
-    # experts as weight0.., EP=2 stores num_experts/EP as weight0.. per rank -- so patch them
+    # experts as weight0.., EP=4 stores num_experts/EP as weight0.. per rank -- so patch them
     # by global index (model local weight i == reference global weight local_expert_indices[i]).
     model.load_state_dict(reference.state_dict(), strict=False)
     for model_layer, reference_layer in zip(model.decoder.layers, reference.decoder.layers):
@@ -225,7 +225,7 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
     torch.testing.assert_close(
         torch.stack(model_losses),
         torch.stack(reference_losses),
-        msg="EP=2 mFSDP model did not reproduce full-batch EP=1 training.",
+        msg="EP=4 mFSDP model did not reproduce full-batch EP=1 training.",
     )
 
     # Destroy the groups this test created; leave the default (world) group for later tests.
