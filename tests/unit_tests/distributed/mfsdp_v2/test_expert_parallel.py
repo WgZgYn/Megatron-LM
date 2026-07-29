@@ -150,16 +150,16 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
     num_layers = len(layer_pattern)
     if world_size % ep_size != 0 or num_experts % ep_size != 0:
         pytest.skip(f"world_size {world_size} is incompatible with EP={ep_size}.")
-    dp_size = world_size // ep_size
+    edp_size = world_size // ep_size
     global_batch = world_size * b_local  # one shard per rank
 
     # Process groups (no global parallel_state). world_mesh: the full DP group; moe_mesh: the
-    # ep (ep_size-way) and expert-DP (dp_size-way) groups for the EP=4 model. Meshes also
+    # ep (ep_size-way) and expert-DP (edp_size-way) groups for the EP=4 model. Meshes also
     # initialize the default process group, so build them before the size-1 group below.
     world_mesh = init_device_mesh(device.type, (world_size,))
     world = world_mesh.get_group()
-    moe_mesh = init_device_mesh(device.type, (dp_size, ep_size), mesh_dim_names=("dp", "ep"))
-    ep_group, expert_dp_group = moe_mesh.get_group("ep"), moe_mesh.get_group("dp")
+    moe_mesh = init_device_mesh(device.type, (edp_size, ep_size), mesh_dim_names=("edp", "ep"))
+    ep_group, expert_dp_group = moe_mesh.get_group("ep"), moe_mesh.get_group("edp")
     # This rank's size-1 group: the trivial TP=PP=CP axes and the EP=1 reference's ep group.
     one = dist.new_group([rank], use_local_synchronization=True)
 
@@ -203,7 +203,7 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
         if isinstance(decoder_layer, MoETransformerLayer):
             fully_shard(
                 decoder_layer.mlp.experts,
-                mesh=moe_mesh["dp"],
+                mesh=moe_mesh["edp"],
                 placements=_FLAT_SHARD,
                 grad_divisor=ep_size,
             )
