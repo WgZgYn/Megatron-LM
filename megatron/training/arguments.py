@@ -502,7 +502,7 @@ def validate_args(args, defaults={}):
                     assert len(args.decoder_num_layers_per_pipeline_stage) == args.transformer_pipeline_model_parallel_size, \
                         '--decoder-num-layers-per-pipeline-stage must have one entry per pipeline stage'
                     assert num_layers == sum(args.decoder_num_layers_per_pipeline_stage), \
-                        'sum of --decoder-num-layers-per-pipeline-stage must equal the number of layers'
+                        f'sum of --decoder-num-layers-per-pipeline-stage {args.decoder_num_layers_per_pipeline_stage} must equal the number of layers {num_layers}'
                     assert all(x > 0 for x in args.decoder_num_layers_per_pipeline_stage), \
                         'all entries of --decoder-num-layers-per-pipeline-stage must be larger than 0'
                     
