@@ -29,7 +29,10 @@ def get_transformer_layer_offset(config: TransformerConfig):
         if pp_decoder_start is not None:
             pipeline_rank = pipeline_rank - pp_decoder_start
 
-    if config.pipeline_model_parallel_size > 1:
+    if config.decoder_num_layers_per_pipeline_stage is not None:
+        # Explicit per-stage layer distribution.
+        offset = sum(config.decoder_num_layers_per_pipeline_stage[:pipeline_rank])
+    elif config.pipeline_model_parallel_size > 1:
 
         if (
             config.num_layers_in_first_pipeline_stage is not None

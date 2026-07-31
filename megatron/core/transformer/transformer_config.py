@@ -42,6 +42,10 @@ class TransformerConfig(ModelParallelConfig):
     num_layers_in_last_pipeline_stage: Optional[int] = None
     """Number of transformer layers on last pipeline stage.
     None implies equal layer division across PP ranks."""
+    
+    decoder_num_layers_per_pipeline_stage: Optional[List[int]] = None
+    """Number of transformer layers on each pipeline stage.
+    None implies equal layer division across PP ranks."""
 
     account_for_embedding_in_pipeline_split: bool = False
     """If set, the embedding layer will be treated as a standard transformer
@@ -776,6 +780,31 @@ class TransformerConfig(ModelParallelConfig):
                 'and account_for_loss_in_pipeline_split'
             )
 
+        if self.decoder_num_layers_per_pipeline_stage is not None:
+            if (
+                self.num_layers_in_first_pipeline_stage is not None
+                or self.num_layers_in_last_pipeline_stage is not None
+            ):
+                raise ValueError(
+                    'decoder_num_layers_per_pipeline_stage cannot be set at the same time with '
+                    'num_layers_in_first_pipeline_stage or num_layers_in_last_pipeline_stage'
+                )
+
+            if (
+                self.account_for_embedding_in_pipeline_split
+                or self.account_for_loss_in_pipeline_split
+            ):
+                raise ValueError(
+                    'decoder_num_layers_per_pipeline_stage cannot be set at the same time with '
+                    'account_for_embedding_in_pipeline_split or account_for_loss_in_pipeline_split'
+                )
+
+            if self.virtual_pipeline_model_parallel_size is not None:
+                raise ValueError(
+                    'decoder_num_layers_per_pipeline_stage does not support virtual pipeline '
+                    'parallelism (interleaved schedule)'
+                )
+
         if (
             self.num_layers_in_first_pipeline_stage is not None
             or self.num_layers_in_last_pipeline_stage is not None
@@ -839,6 +868,26 @@ class TransformerConfig(ModelParallelConfig):
                         f'{num_layers_per_middle_pipeline_rank} must be divisible by virtual'
                         f'pipeline parallel degree {self.virtual_pipeline_model_parallel_size}'
                     )
+
+        if self.decoder_num_layers_per_pipeline_stage is not None:
+            if len(self.decoder_num_layers_per_pipeline_stage) != self.pipeline_model_parallel_size:
+                raise ValueError(
+                    f'decoder_num_layers_per_pipeline_stage must have length equal to '
+                    f'pipeline_model_parallel_size {self.pipeline_model_parallel_size}, got '
+                    f'{len(self.decoder_num_layers_per_pipeline_stage)}'
+                )
+
+            if sum(self.decoder_num_layers_per_pipeline_stage) != self.num_layers:
+                raise ValueError(
+                    f'sum of decoder_num_layers_per_pipeline_stage '
+                    f'{self.decoder_num_layers_per_pipeline_stage} must equal num_layers '
+                    f'{self.num_layers}'
+                )
+
+            if not all(x > 0 for x in self.decoder_num_layers_per_pipeline_stage):
+                raise ValueError(
+                    'all elements of decoder_num_layers_per_pipeline_stage must be larger than 0'
+                )
 
         if self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split:
             if self.virtual_pipeline_model_parallel_size is None:

@@ -58,6 +58,14 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
     Returns:
         int: The number of layers to be built for the current pipeline stage.
     """
+    if config.decoder_num_layers_per_pipeline_stage is not None:
+        pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
+        if not parallel_state.is_inside_encoder():
+            pp_decoder_start = parallel_state.get_pipeline_model_parallel_decoder_start()
+            if pp_decoder_start is not None:
+                pipeline_rank = pipeline_rank - pp_decoder_start
+        return config.decoder_num_layers_per_pipeline_stage[pipeline_rank]
+
     if (
         config.num_layers_in_first_pipeline_stage is not None
         or config.num_layers_in_last_pipeline_stage is not None
