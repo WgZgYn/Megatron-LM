@@ -249,14 +249,6 @@ class FsdpParameterGroup:
         # so keep the shared storage-release path.
         self._unsharded_model_weight.release_storage()
 
-    def _install_sharded_grads(self, grad_buffer: DBuffer | None = None) -> None:
-        """Point each sharded parameter's grad at main_grad's current DTensor view."""
-        if grad_buffer is None:
-            grad_buffer = self.main_grad
-        assert grad_buffer is not None
-        for index, sharded_parameter in enumerate(self.sharded_parameters):
-            sharded_parameter.grad = grad_buffer.get_dtensor(index)
-
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
@@ -296,24 +288,6 @@ class FsdpParameterGroup:
         """
         assert self.main_grad is not None
 
-        finalize_axis = changed_mesh_axis(self.main_grad.placements, self.main_weight.placements)
-        if finalize_axis == self.mesh.ndim - 1 and isinstance(
-            self.main_grad.placements[finalize_axis], Partial
-        ):
-            with self._symmetric_memory_context():
-                partial_grad = partial_grad.cast(self.main_grad.dtype)
-            if not is_last_microbatch:
-                self.main_grad.local_buffer.add_(partial_grad.local_buffer)
-                return
-            partial_grad.local_buffer.add_(self.main_grad.local_buffer)
-            if self._symm_mem_pool is not None:
-                partial_grad.rendezvous(finalize_axis)
-            optimizer_grad = partial_grad.redistribute(self.main_weight.placements)
-            if partial_grad.placements[finalize_axis].reduce_op == dist.ReduceOp.SUM:
-                optimizer_grad.local_buffer.div_(self.mesh.size(finalize_axis))
-            self._install_sharded_grads(optimizer_grad)
-            self.main_grad.local_buffer.zero_()
-            return
 
         def has_grad(parameters: tuple[nn.Parameter, ...]) -> bool:
             has_any_grad = False
@@ -327,40 +301,52 @@ class FsdpParameterGroup:
                 raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
             return has_any_grad
 
-        # zero_grad(set_to_none=True) clears sharded parameter grads, so this
-        # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
-        # leaves sharded grads installed, so this backward accumulates into main_grad.
-        has_sharded_grads = has_grad(self.sharded_parameters)
+        # Installed grads indicate that the current main_grad already contains values.
+        has_accumulated_grads = has_grad(self.sharded_parameters)
 
-        # A non-accumulation main_grad means the previous step finalized it; this
-        # only happens on the first microbatch. Redistribute it back to the
-        # DP-outer-Partial accumulation placement -- a metadata relabel for HSDP,
-        # and a fresh reduce-scattered buffer for HFSDP in the future.
+        # A finalized main_grad belongs to the previous optimizer step. Start the
+        # next accumulation cycle with fresh storage rather than reconstructing the
+        # full gradient from its optimizer shard.
         if self.main_grad.placements != self._accumulation_placements:
-            self.main_grad = self.main_grad.redistribute(self._accumulation_placements)
+            self.main_grad = DBuffer(
+                mesh=self.mesh,
+                placements=self._accumulation_placements,
+                tensor_shapes=self.main_grad.layout.tensor_shapes,
+                dtype=self.main_grad.dtype,
+                device=self.main_grad.device,
+            )
+            # Old installed grad views do not belong to this fresh storage.
+            has_accumulated_grads = False
 
         can_reduce_into_main_grad = (
-            not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
+            not has_accumulated_grads and partial_grad.dtype == self.main_grad.dtype
         )
         reduce_axis = changed_mesh_axis(partial_grad.placements, self.main_grad.placements)
         if reduce_axis is None:
-            raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
-        partial_reduce_op = partial_grad.placements[reduce_axis].reduce_op
-        grad_divisor = self.mesh.size(reduce_axis) if partial_reduce_op == dist.ReduceOp.SUM else 1
-        if self._symm_mem_pool is not None:
-            partial_grad.rendezvous(reduce_axis)
-        if can_reduce_into_main_grad:
-            partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
-            if grad_divisor != 1:
-                self.main_grad.local_buffer.div_(grad_divisor)
-        else:
-            reduced_grad = partial_grad.redistribute(self.main_grad.placements)
-            if grad_divisor != 1:
-                reduced_grad.local_buffer.div_(grad_divisor)
-            if has_sharded_grads:
-                self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
+            assert isinstance(self.main_grad.placements[-1], Partial), (
+                "The last placement must be Partial"
+            )
+            if has_accumulated_grads:
+                self.main_grad.local_buffer.add_(partial_grad.local_buffer)
             else:
-                self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
+                self.main_grad.local_buffer.copy_(partial_grad.local_buffer)
+        else:
+            partial_reduce_op = partial_grad.placements[reduce_axis].reduce_op
+            grad_divisor = self.mesh.size(reduce_axis) if partial_reduce_op == dist.ReduceOp.SUM else 1
+            if self._symm_mem_pool is not None:
+                partial_grad.rendezvous(reduce_axis)
+            if can_reduce_into_main_grad:
+                partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
+                if grad_divisor != 1:
+                    self.main_grad.local_buffer.div_(grad_divisor)
+            else:
+                reduced_grad = partial_grad.redistribute(self.main_grad.placements)
+                if grad_divisor != 1:
+                    reduced_grad.local_buffer.div_(grad_divisor)
+                if has_accumulated_grads:
+                    self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
+                else:
+                    self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
 
         if is_last_microbatch:
             # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
