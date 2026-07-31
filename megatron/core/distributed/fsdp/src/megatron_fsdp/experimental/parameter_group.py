@@ -44,6 +44,7 @@ class FsdpParameterGroup:
     mesh: DeviceMesh
     dtype: torch.dtype
     requires_grad: bool
+    is_first_microbatch: bool
     main_weight: DBuffer
     model_weight: DBuffer
     main_grad: DBuffer | None
@@ -85,6 +86,7 @@ class FsdpParameterGroup:
         first_parameter = next(iter(parameters.values()))
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
+        self.is_first_microbatch = True
         for name, parameter in parameters.items():
             if parameter.dtype != self.dtype:
                 raise ValueError(
@@ -229,6 +231,8 @@ class FsdpParameterGroup:
                 self._unsharded_model_weight.placements, out=self._unsharded_model_weight
             )
         self._switch_to_unsharded_parameters()
+        if self.is_first_microbatch:
+            self.is_first_microbatch = False
 
     def reshard_parameters(self) -> None:
         """Install sharded DTensor parameters on the owning modules."""
@@ -336,6 +340,8 @@ class FsdpParameterGroup:
             optimizer_grad = self.main_grad.redistribute(self.main_weight.placements)
             if optimizer_grad is not self.main_grad:
                 self.main_grad.local_buffer.zero_()
+            # Reset for the first microbatch of the next accumulation cycle.
+            self.is_first_microbatch = True
 
         # Install the accumulation grad between microbatches and the finalized grad
         # for optimizer.step() after the last microbatch.
