@@ -23,13 +23,13 @@ fi
 DISTRIBUTED_ARGS=(--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES
                   --master_addr $MASTER_ADDR --master_port $MASTER_PORT)
 
-# 12 layers, hidden=512, mock data, bf16
+# 12 layers, hidden=512, mock data, fp16
 GPT_MODEL_ARGS=(--num-layers 12 --hidden-size 512 --num-attention-heads 8
                 --seq-length 128 --max-position-embeddings 128)
 
 TRAINING_ARGS=(--micro-batch-size 2 --global-batch-size 8 --train-iters 30
                --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.95
-               --init-method-std 0.006 --clip-grad 1.0 --bf16
+               --init-method-std 0.006 --clip-grad 1.0 --fp16
                --lr 6.0e-5 --lr-decay-style cosine --min-lr 6.0e-6
                --lr-warmup-fraction .001)
 
