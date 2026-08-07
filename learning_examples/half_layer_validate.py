@@ -71,12 +71,13 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 
 # Get a full layer spec template
-full_spec = get_gpt_layer_local_spec(
+# get_gpt_layer_local_spec returns ModuleSpec(module=TransformerLayer, submodules=...)
+# This IS the per-layer spec — use it directly, not .layer_specs
+dense_template = get_gpt_layer_local_spec(
     num_experts=None, moe_grouped_gemm=False,
     qk_layernorm=False, multi_latent_attention=False,
     moe_use_legacy_grouped_gemm=False, normalization="LayerNorm",
 )
-dense_template = full_spec.layer_specs[0]
 all_specs = [dense_template] * 4
 
 # Build per-stage specs
