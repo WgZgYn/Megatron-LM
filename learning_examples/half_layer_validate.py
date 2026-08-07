@@ -16,7 +16,9 @@ import torch
 import torch.distributed as dist
 
 # Init distributed BEFORE importing Megatron (it calls get_args etc.)
-dist.init_process_group(backend="gloo" if not torch.cuda.is_available() else "nccl")
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+torch.cuda.set_device(local_rank)
+dist.init_process_group(backend="nccl")
 rank = dist.get_rank()
 world_size = dist.get_world_size()
 
@@ -32,7 +34,7 @@ import megatron.core.parallel_state as mpu
 mpu.initialize_model_parallel(
     tensor_model_parallel_size=1,
     pipeline_model_parallel_size=2,
-    pipeline_model_parallel_comm_backend="gloo" if not torch.cuda.is_available() else None,
+    pipeline_model_parallel_comm_backend=None,  # None = use default (nccl)
     context_parallel_size=1,
     expert_model_parallel_size=1,
     order="tp-cp-ep-dp-pp",
@@ -107,10 +109,10 @@ else:
         all_specs[3],  # full layer 4
     ]
 
-# Build modules
+# Build modules (on CUDA)
 modules = []
 for i, spec in enumerate(stage_specs):
-    m = build_module(spec, config=config, layer_number=i + 1)
+    m = build_module(spec, config=config, layer_number=i + 1).cuda()
     modules.append(m)
 
 # Print inventory
@@ -120,7 +122,8 @@ dist.barrier()
 
 # ═══ Forward test (no PP communication — manual hand-off) ═══
 torch.manual_seed(42 + rank)
-x0 = torch.randn(2, 1, 128)  # input to stage 0
+device = torch.device("cuda")
+x0 = torch.randn(2, 1, 128, device=device)  # input to stage 0
 
 if pp_rank == 0:
     hidden = x0
@@ -145,8 +148,8 @@ if pp_rank == 0:
     dist.send(pending[1].contiguous(), dst=1)
 
     # Receive grads back (after rank 1 backward)
-    grad_pre_mlp = torch.zeros_like(pending[0])
-    grad_residual = torch.zeros_like(pending[1])
+    grad_pre_mlp = torch.zeros_like(pending[0], device=device)
+    grad_residual = torch.zeros_like(pending[1], device=device)
     dist.recv(grad_pre_mlp, src=1)
     dist.recv(grad_residual, src=1)
 
@@ -160,8 +163,8 @@ if pp_rank == 0:
 
 else:
     # Rank 1: receive from rank 0
-    recv_pre_mlp = torch.zeros(2, 1, 128)
-    recv_residual = torch.zeros(2, 1, 128)
+    recv_pre_mlp = torch.zeros(2, 1, 128, device=device)
+    recv_residual = torch.zeros(2, 1, 128, device=device)
     dist.recv(recv_pre_mlp, src=0)
     dist.recv(recv_residual, src=0)
 
