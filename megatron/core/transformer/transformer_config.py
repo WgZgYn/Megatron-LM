@@ -47,6 +47,18 @@ class TransformerConfig(ModelParallelConfig):
     """Number of transformer layers on each pipeline stage.
     None implies equal layer division across PP ranks."""
 
+    pipeline_split_layers: Optional[List[int]] = None
+    """Global (1-based) transformer layer indices split at the attention/FFN boundary
+    across adjacent pipeline stages. The attention half ends the stage whose cumulative
+    layer count equals the index; the FFN half leads the next stage.
+    Requires ``decoder_num_layers_per_pipeline_stage``."""
+
+    split_all_layers: bool = False
+    """If True, EVERY transformer layer is split at the attention/FFN boundary,
+    producing pairs of AttentionSubLayer + FFNSubLayer within each pipeline stage.
+    No cross-stage split occurs — each stage simply runs twice as many half-layers.
+    Mutually exclusive with ``pipeline_split_layers`` and VPP."""
+
     account_for_embedding_in_pipeline_split: bool = False
     """If set, the embedding layer will be treated as a standard transformer
     layer in the context of partition and placement for pipeline parallelism."""
@@ -888,6 +900,55 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     'all elements of decoder_num_layers_per_pipeline_stage must be larger than 0'
                 )
+
+        # ═══ Half-layer PP: validate split modes ═══
+        if self.split_all_layers:
+            if self.pipeline_split_layers is not None:
+                raise ValueError(
+                    'split_all_layers and pipeline_split_layers are mutually exclusive'
+                )
+            if self.virtual_pipeline_model_parallel_size is not None:
+                raise ValueError('split_all_layers does not support VPP')
+            if self.recompute_granularity == 'full':
+                raise ValueError('split_all_layers does not support recompute_granularity=full')
+
+        if self.split_all_layers and self.pipeline_split_layers is not None:
+            raise ValueError(
+                'split_all_layers and pipeline_split_layers are mutually exclusive'
+            )
+        if self.pipeline_split_layers is not None:
+            if self.decoder_num_layers_per_pipeline_stage is None:
+                raise ValueError(
+                    'pipeline_split_layers requires decoder_num_layers_per_pipeline_stage '
+                    'to determine stage boundaries'
+                )
+            if self.virtual_pipeline_model_parallel_size is not None:
+                raise ValueError(
+                    'pipeline_split_layers does not support virtual pipeline parallelism (VPP)'
+                )
+            if self.recompute_granularity == 'full':
+                raise ValueError(
+                    'pipeline_split_layers does not support recompute_granularity=full'
+                )
+            # Compute valid split positions: each is sum(dist[:k+1]) for some stage k
+            cumsum = 0
+            valid_boundaries = set()
+            for n in self.decoder_num_layers_per_pipeline_stage[:-1]:
+                cumsum += n
+                valid_boundaries.add(cumsum)
+            for L in self.pipeline_split_layers:
+                if L < 1 or L >= self.num_layers:
+                    raise ValueError(
+                        f'pipeline_split_layers index {L} out of range [1, {self.num_layers-1}]'
+                    )
+                if L not in valid_boundaries:
+                    raise ValueError(
+                        f'pipeline_split_layers index {L} is not a stage boundary. '
+                        f'Valid boundaries: {sorted(valid_boundaries)}'
+                    )
+            if len(self.pipeline_split_layers) != len(set(self.pipeline_split_layers)):
+                raise ValueError('pipeline_split_layers contains duplicate indices')
+        # ═══ END half-layer validation ═══
 
         if self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split:
             if self.virtual_pipeline_model_parallel_size is None:

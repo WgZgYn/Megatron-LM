@@ -28,6 +28,10 @@ from megatron.core.transformer.transformer_block import (
     get_num_layers_to_build,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_sublayer import (
+    AttentionSubLayer,
+    FFNSubLayer,
+)
 from megatron.core.transformer.transformer_layer import (
     TransformerLayer,
     TransformerLayerSubmodules,
@@ -415,7 +419,59 @@ def get_gpt_decoder_block_spec(
     # Note: MCore layer_number starts at 1
     offset = get_transformer_layer_offset(config)
     num_layers_to_build = get_num_layers_to_build(config)
-    layer_specs = layer_specs[offset : offset + num_layers_to_build]
+
+    if config.split_all_layers:
+        # ═══ Half-layer PP (all layers): produce [Attn, FFN] pair per layer ═══
+        stage_specs = []
+        for g in range(offset + 1, offset + num_layers_to_build + 1):
+            full_spec = layer_specs[g - 1]
+            stage_specs.append(ModuleSpec(
+                module=AttentionSubLayer,
+                params={"global_layer_number": g},
+                submodules=full_spec.submodules,
+            ))
+            stage_specs.append(ModuleSpec(
+                module=FFNSubLayer,
+                params={"global_layer_number": g},
+                submodules=full_spec.submodules,
+            ))
+        layer_specs = stage_specs
+        # ═══ END split-all-layers spec construction ═══
+    elif config.pipeline_split_layers is not None:
+        # ═══ Half-layer PP (selective): per-stage specs with split layers ═══
+        start_layer = offset + 1   # 1-based first layer index of this stage
+        end_layer = offset + num_layers_to_build  # 1-based last layer index
+
+        stage_specs = []
+        # Left boundary: if THIS stage's FIRST layer is the FFN half of a split
+        previous_layer = start_layer - 1
+        if previous_layer in config.pipeline_split_layers:
+            full_spec = layer_specs[previous_layer - 1]  # 0-indexed
+            ffn_spec = ModuleSpec(
+                module=FFNSubLayer,
+                params={"global_layer_number": previous_layer},
+                submodules=full_spec.submodules,
+            )
+            stage_specs.append(ffn_spec)
+
+        # Full layers in the middle
+        for g in range(start_layer, end_layer + 1):
+            is_split_right = g in config.pipeline_split_layers
+            if is_split_right:
+                full_spec = layer_specs[g - 1]
+                attn_spec = ModuleSpec(
+                    module=AttentionSubLayer,
+                    params={"global_layer_number": g},
+                    submodules=full_spec.submodules,
+                )
+                stage_specs.append(attn_spec)
+            else:
+                stage_specs.append(layer_specs[g - 1])
+
+        layer_specs = stage_specs
+        # ═══ END selective-split spec construction ═══
+    else:
+        layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Block spec.
     block_spec = TransformerBlockSubmodules(layer_specs=layer_specs, layer_norm=layer_norm_impl)

@@ -1037,6 +1037,8 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
     kw_args['decoder_num_layers_per_pipeline_stage'] = args.decoder_num_layers_per_pipeline_stage
+    kw_args['pipeline_split_layers'] = args.pipeline_split_layers
+    kw_args['split_all_layers'] = args.split_all_layers
     kw_args['fp8_param'] = args.fp8_param_gather
     if args.swiglu:
         kw_args['activation_func'] = F.silu
@@ -2080,8 +2082,23 @@ def _add_distributed_args(parser):
                        help=('The number of transformer layers on each pipeline stage of the decoder. '
                        'Must have one entry per pipeline stage and sum to the total number of layers. '
                        'Default None is even split of transformer layers across all pipeline stages.'))
-    
-    
+
+    group.add_argument('--pipeline-split-layers',
+                       type=int, default=None, nargs='+', metavar='N',
+                       help=('Global (1-based) transformer layer indices to split at the '
+                       'attention/FFN boundary across adjacent pipeline stages. '
+                       'Each index must be a stage boundary (cumulative sum of '
+                       '--decoder-num-layers-per-pipeline-stage). Requires '
+                       '--decoder-num-layers-per-pipeline-stage.'))
+
+    group.add_argument('--split-all-layers', action='store_true',
+                       default=None,
+                       help=('Split EVERY transformer layer at the attention/FFN boundary. '
+                       'Each pipeline stage builds pairs of AttentionSubLayer + FFNSubLayer '
+                       'instead of full TransformerLayers. No cross-stage split occurs. '
+                       'Mutually exclusive with --pipeline-split-layers and VPP.'))
+
+
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
