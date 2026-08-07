@@ -964,6 +964,25 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             mpu.get_pipeline_model_parallel_rank(),
             num_parameters), flush=True)
 
+    # ═══ CUSTOM LOG: per-rank model info ═══
+    rank = torch.distributed.get_rank()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    dp_rank = mpu.get_data_parallel_rank()
+    layers_info = ""
+    for i, model_chunk in enumerate(model):
+        inner = model_chunk.module if hasattr(model_chunk, 'module') else model_chunk
+        if hasattr(inner, 'decoder') and hasattr(inner.decoder, 'num_layers_per_pipeline_rank'):
+            n = inner.decoder.num_layers_per_pipeline_rank
+            layers_info += f"[chunk{i}: {n} layers] "
+    role = ""
+    if mpu.is_pipeline_first_stage(): role += " FIRST"
+    if mpu.is_pipeline_last_stage():  role += " LAST"
+    print(f"[MODEL] RANK={rank:2d} tp={tp_rank} pp={pp_rank} dp={dp_rank} | "
+          f"params={num_parameters/1e6:.1f}M | {layers_info}|{role}",
+          flush=True)
+    # ═══ END CUSTOM LOG ═══
+
     # GPU allocation.
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
@@ -1215,6 +1234,20 @@ def train_step(forward_step_func, data_iterator,
     """Single training step."""
     args = get_args()
     timers = get_timers()
+
+    # ═══ CUSTOM LOG: per-step rank + memory snapshot ═══
+    if args.curr_iteration % 50 == 0:
+        g_rank = torch.distributed.get_rank()
+        tp_r = mpu.get_tensor_model_parallel_rank()
+        pp_r = mpu.get_pipeline_model_parallel_rank()
+        dp_r = mpu.get_data_parallel_rank()
+        mem_alloc = torch.cuda.memory_allocated() / 1024**2
+        mem_resv  = torch.cuda.memory_reserved() / 1024**2
+        print(f"[STEP {args.curr_iteration:4d}] RANK={g_rank:2d} "
+              f"tp={tp_r} pp={pp_r} dp={dp_r} | "
+              f"mem_used={mem_alloc:.0f}MiB mem_reserved={mem_resv:.0f}MiB",
+              flush=True)
+    # ═══ END CUSTOM LOG ═══
 
     # CUDA Graph capturing only executes once, when it's the first training iteration.
     if args.curr_iteration == args.iteration and args.external_cuda_graph:
