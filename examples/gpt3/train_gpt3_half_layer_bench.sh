@@ -59,15 +59,15 @@ run_exp "pp2_split_uniform" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
     --split-all-layers
 
-# A3) Uneven split: 1 full layer → 2 halves on GPU0, 5 full → 10 halves on GPU1
-run_exp "pp2_split_uneven_1_5" \
+# A3) Uneven split: 4 full → 8 halves on GPU0, 8 full → 16 halves on GPU1 (mild imbalance)
+run_exp "pp2_split_uneven_4_8" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
-    --split-all-layers --decoder-num-layers-per-pipeline-stage 1 5
+    --split-all-layers --decoder-num-layers-per-pipeline-stage 4 8
 
-# A4) Uneven split: 2 full → 4 halves on GPU0, 4 full → 8 halves on GPU1 (milder imbalance)
-run_exp "pp2_split_uneven_2_4" \
+# A4) Uneven split: 3 full → 6 halves on GPU0, 9 full → 18 halves on GPU1 (extreme imbalance)
+run_exp "pp2_split_uneven_3_9" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
-    --split-all-layers --decoder-num-layers-per-pipeline-stage 2 4
+    --split-all-layers --decoder-num-layers-per-pipeline-stage 3 9
 
 # ═══ PP=4 experiments ═══
 
@@ -94,8 +94,8 @@ echo "=== SUMMARY ==="
 echo "PP=2 logs:"
 echo "  A1 baseline:     /tmp/pp_bench_pp2_baseline.log"
 echo "  A2 split uniform: /tmp/pp_bench_pp2_split_uniform.log"
-echo "  A3 split 1+5:    /tmp/pp_bench_pp2_split_uneven_1_5.log"
-echo "  A4 split 2+4:    /tmp/pp_bench_pp2_split_uneven_2_4.log"
+echo "  A3 split 4+8:    /tmp/pp_bench_pp2_split_uneven_4_8.log"
+echo "  A4 split 3+9:    /tmp/pp_bench_pp2_split_uneven_3_9.log"
 echo "PP=4 logs:"
 echo "  B1 baseline:     /tmp/pp_bench_pp4_baseline.log"
 echo "  B2 split uniform: /tmp/pp_bench_pp4_split_uniform.log"
