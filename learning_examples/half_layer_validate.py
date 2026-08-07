@@ -44,6 +44,10 @@ g_rank = dist.get_rank()
 
 print(f"[INIT] global_rank={g_rank} pp_rank={pp_rank}/{pp_size}", flush=True)
 
+# Initialize CUDA RNG tracker (required by ColumnParallelLinear/RowParallelLinear weight init)
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+model_parallel_cuda_manual_seed(42)
+
 # ═══ Build config ═══
 from megatron.core.transformer.transformer_config import TransformerConfig
 
