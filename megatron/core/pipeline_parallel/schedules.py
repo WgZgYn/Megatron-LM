@@ -2038,14 +2038,21 @@ def forward_backward_pipelining_without_interleaving(
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
 
-    # ═══ CUSTOM LOG: phase timing summary ═══
+    # ═══ CUSTOM LOG: phase timing summary (every PP_TIMING_INTERVAL steps, default 10) ═══
     _cooldown_end = _time.time()
-    print(f"[PP TIMING] RANK={g_rank_pt} pp_rank={pp_rank_pt} | "
-          f"warmup={(_warmup_end-_warmup_start)*1000:.0f}ms | "
-          f"1f1b={(_onef1b_end-_onef1b_start)*1000:.0f}ms | "
-          f"cooldown={(_cooldown_end-_cooldown_start)*1000:.0f}ms | "
-          f"total={(_cooldown_end-_warmup_start)*1000:.0f}ms",
-          flush=True)
+    import os as _os
+    _pp_timing_interval = int(_os.environ.get("PP_TIMING_INTERVAL", "10"))
+    if not hasattr(forward_backward_pipelining_without_interleaving, "_step_count"):
+        forward_backward_pipelining_without_interleaving._step_count = 0
+    _step = forward_backward_pipelining_without_interleaving._step_count
+    forward_backward_pipelining_without_interleaving._step_count += 1
+    if _step % _pp_timing_interval == 0:
+        print(f"[PP TIMING] step={_step} RANK={g_rank_pt} pp_rank={pp_rank_pt} | "
+              f"warmup={(_warmup_end-_warmup_start)*1000:.0f}ms | "
+              f"1f1b={(_onef1b_end-_onef1b_start)*1000:.0f}ms | "
+              f"cooldown={(_cooldown_end-_cooldown_start)*1000:.0f}ms | "
+              f"total={(_cooldown_end-_warmup_start)*1000:.0f}ms",
+              flush=True)
     # ═══ END CUSTOM LOG ═══
 
     if config.finalize_model_grads_func is not None and not forward_only:
