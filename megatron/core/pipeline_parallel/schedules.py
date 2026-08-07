@@ -1823,18 +1823,21 @@ def forward_backward_pipelining_without_interleaving(
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
 
-    # ═══ CUSTOM LOG: PP schedule parameters ═══
-    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
-    g_rank = torch.distributed.get_rank()
-    if g_rank == 0 or pp_rank == 0:
-        print(f"[PP SCHEDULE] global_rank={g_rank} pp_rank={pp_rank}/{pp_size} | "
-              f"total_mb={num_microbatches} | "
-              f"warmup={num_warmup_microbatches} | "
-              f"1f1b={num_microbatches_remaining} | "
-              f"cooldown={num_warmup_microbatches} | "
-              f"bubble_est={(pp_size-1)/num_microbatches*100:.1f}%",
-              flush=True)
+    # ═══ CUSTOM LOG: PP schedule parameters (step 0 only) ═══
+    if not hasattr(forward_backward_pipelining_without_interleaving, "_step_count"):
+        forward_backward_pipelining_without_interleaving._step_count = 0
+    if forward_backward_pipelining_without_interleaving._step_count == 0:
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+        g_rank = torch.distributed.get_rank()
+        if g_rank == 0 or pp_rank == 0:
+            print(f"[PP SCHEDULE] global_rank={g_rank} pp_rank={pp_rank}/{pp_size} | "
+                  f"total_mb={num_microbatches} | "
+                  f"warmup={num_warmup_microbatches} | "
+                  f"1f1b={num_microbatches_remaining} | "
+                  f"cooldown={num_warmup_microbatches} | "
+                  f"bubble_est={(pp_size-1)/num_microbatches*100:.1f}%",
+                  flush=True)
     # ═══ END CUSTOM LOG ═══
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
