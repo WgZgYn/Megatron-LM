@@ -61,10 +61,18 @@ def parse_log(path):
         }
 
     # --- Split mode ---
-    if '--split-all-layers' in text:
+    # Check per-rank layer inventory: if [MODEL] log shows 2x layers vs
+    # baseline (e.g. 6 vs 3 for PP=4), it's split_all_layers.
+    layer_counts_per_rank = []
+    for m in re.finditer(r'\[MODEL\].*?\[chunk0: (\d+) layers\]', text):
+        layer_counts_per_rank.append(int(m.group(1)))
+    # Also check model log for AttentionSubLayer mention (split_all produces these)
+    has_attn_half = 'AttentionSubLayer' in text or 'FFNSubLayer' in text
+
+    if has_attn_half:
         mode = 'split-all'
-    elif '--pipeline-split-layers' in text:
-        mode = 'split-selective'
+    elif '--split-all-layers' in text or 'pipeline_split_layers' in text:
+        mode = 'split-selective' if 'pipeline_split_layers' in text else 'split-all'
     else:
         mode = 'baseline'
 
