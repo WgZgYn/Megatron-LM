@@ -435,7 +435,7 @@ def validate_args(args, defaults={}):
             '(virtual) pipeline parallelism'
         assert args.decoder_num_half_layers_per_pipeline_stage is None, \
             '--decoder-num-half-layers-per-pipeline-stage does not support interleaved ' \
-            '(virtual) pipeline parallelism''
+            '(virtual) pipeline parallelism'
         if args.overlap_p2p_comm:
             assert args.pipeline_model_parallel_size > 1, \
                 'When interleaved schedule is used, pipeline-model-parallel size '\
