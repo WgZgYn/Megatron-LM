@@ -111,17 +111,16 @@ def summarize(data):
     t = data['iter_times']
     time_str = f"{statistics.median(t):.0f}ms" if t else "N/A"
 
-    # Memory: per-rank max_allocated, show min-max spread
+    # Memory: per-rank max_allocated, show each rank
     mems = data['rank_mems']
     if mems:
-        vals = sorted(int(v[1]) for v in mems.values())
-        mem_str = f"{vals[0]}" if len(vals) == 1 or vals[0] == vals[-1] else f"{vals[0]}-{vals[-1]}MiB"
+        mem_str = "  ".join(f"R{r}={int(v[1])}MiB" for r, v in sorted(mems.items()))
     else:
         mem_str = "N/A"
 
     pp = data.get('pp_size', '?')
 
-    return (f"{data['name']:28s}  {mem_str:>12s}  {time_str:>8s}  "
+    return (f"{data['name']:28s}  {mem_str:>50s}  {time_str:>8s}  "
             f"PP={pp}  {mode:12s}  {cfg}")
 
 
@@ -131,7 +130,7 @@ def main():
         print("No log files. Usage: python parse_pp_bench.py <log1> [log2 ...]")
         sys.exit(1)
 
-    header = (f"{'Config':28s}  {'Memory':>12s}  {'Time(median)':>8s}  "
+    header = (f"{'Config':28s}  {'Memory (max allocated per rank)':>50s}  {'Time(median)':>8s}  "
               f"{'PP':>4s}  {'Mode':12s}  {'Distribution'}")
     print(header)
     print("-" * len(header))
