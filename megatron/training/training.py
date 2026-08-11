@@ -964,23 +964,25 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             mpu.get_pipeline_model_parallel_rank(),
             num_parameters), flush=True)
 
-    # ═══ CUSTOM LOG: per-rank model info ═══
-    rank = torch.distributed.get_rank()
-    tp_rank = mpu.get_tensor_model_parallel_rank()
-    pp_rank = mpu.get_pipeline_model_parallel_rank()
-    dp_rank = mpu.get_data_parallel_rank()
-    layers_info = ""
-    for i, model_chunk in enumerate(model):
-        inner = model_chunk.module if hasattr(model_chunk, 'module') else model_chunk
-        if hasattr(inner, 'decoder') and hasattr(inner.decoder, 'num_layers_per_pipeline_rank'):
-            n = inner.decoder.num_layers_per_pipeline_rank
-            layers_info += f"[chunk{i}: {n} layers] "
-    role = ""
-    if mpu.is_pipeline_first_stage(): role += " FIRST"
-    if mpu.is_pipeline_last_stage():  role += " LAST"
-    print(f"[MODEL] RANK={rank:2d} tp={tp_rank} pp={pp_rank} dp={dp_rank} | "
-          f"params={num_parameters/1e6:.1f}M | {layers_info}|{role}",
-          flush=True)
+    # ═══ CUSTOM LOG: per-rank model info (env: MEGATRON_DEBUG_LOG=1) ═══
+    import os as _os
+    if _os.environ.get('MEGATRON_DEBUG_LOG', '0') == '1':
+        rank = torch.distributed.get_rank()
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        dp_rank = mpu.get_data_parallel_rank()
+        layers_info = ""
+        for i, model_chunk in enumerate(model):
+            inner = model_chunk.module if hasattr(model_chunk, 'module') else model_chunk
+            if hasattr(inner, 'decoder') and hasattr(inner.decoder, 'num_layers_per_pipeline_rank'):
+                n = inner.decoder.num_layers_per_pipeline_rank
+                layers_info += f"[chunk{i}: {n} layers] "
+        role = ""
+        if mpu.is_pipeline_first_stage(): role += " FIRST"
+        if mpu.is_pipeline_last_stage():  role += " LAST"
+        print(f"[MODEL] RANK={rank:2d} tp={tp_rank} pp={pp_rank} dp={dp_rank} | "
+              f"params={num_parameters/1e6:.1f}M | {layers_info}|{role}",
+              flush=True)
     # ═══ END CUSTOM LOG ═══
 
     # GPU allocation.
@@ -1235,8 +1237,9 @@ def train_step(forward_step_func, data_iterator,
     args = get_args()
     timers = get_timers()
 
-    # ═══ CUSTOM LOG: per-step rank + memory snapshot ═══
-    if args.curr_iteration % 50 == 0:
+    # ═══ CUSTOM LOG: per-step rank + memory snapshot (env: MEGATRON_DEBUG_LOG=1) ═══
+    import os as _os2
+    if _os2.environ.get('MEGATRON_DEBUG_LOG', '0') == '1' and args.curr_iteration % 50 == 0:
         g_rank = torch.distributed.get_rank()
         tp_r = mpu.get_tensor_model_parallel_rank()
         pp_r = mpu.get_pipeline_model_parallel_rank()

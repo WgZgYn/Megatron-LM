@@ -1823,8 +1823,9 @@ def forward_backward_pipelining_without_interleaving(
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
 
-    # ═══ CUSTOM LOG: PP schedule parameters (step 0 only) ═══
-    if not hasattr(forward_backward_pipelining_without_interleaving, "_step_count"):
+    # ═══ CUSTOM LOG: PP schedule parameters (env: MEGATRON_DEBUG_LOG=1) ═══
+    import os as _os3
+    if _os3.environ.get('MEGATRON_DEBUG_LOG', '0') == '1' and not hasattr(forward_backward_pipelining_without_interleaving, "_step_count"):
         forward_backward_pipelining_without_interleaving._step_count = 0
     if forward_backward_pipelining_without_interleaving._step_count == 0:
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -2041,21 +2042,22 @@ def forward_backward_pipelining_without_interleaving(
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
 
-    # ═══ CUSTOM LOG: phase timing summary (every PP_TIMING_INTERVAL steps, default 10) ═══
+    # ═══ CUSTOM LOG: phase timing summary (env: MEGATRON_DEBUG_LOG=1) ═══
     _cooldown_end = _time.time()
-    import os as _os
-    _pp_timing_interval = int(_os.environ.get("PP_TIMING_INTERVAL", "10"))
-    if not hasattr(forward_backward_pipelining_without_interleaving, "_step_count"):
-        forward_backward_pipelining_without_interleaving._step_count = 0
-    _step = forward_backward_pipelining_without_interleaving._step_count
-    forward_backward_pipelining_without_interleaving._step_count += 1
-    if _step % _pp_timing_interval == 0:
-        print(f"[PP TIMING] step={_step} RANK={g_rank_pt} pp_rank={pp_rank_pt} | "
-              f"warmup={(_warmup_end-_warmup_start)*1000:.0f}ms | "
-              f"1f1b={(_onef1b_end-_onef1b_start)*1000:.0f}ms | "
-              f"cooldown={(_cooldown_end-_cooldown_start)*1000:.0f}ms | "
-              f"total={(_cooldown_end-_warmup_start)*1000:.0f}ms",
-              flush=True)
+    import os as _os4
+    if _os4.environ.get('MEGATRON_DEBUG_LOG', '0') == '1':
+        _pp_timing_interval = int(_os4.environ.get("PP_TIMING_INTERVAL", "10"))
+        if not hasattr(forward_backward_pipelining_without_interleaving, "_step_count"):
+            forward_backward_pipelining_without_interleaving._step_count = 0
+        _step = forward_backward_pipelining_without_interleaving._step_count
+        forward_backward_pipelining_without_interleaving._step_count += 1
+        if _step % _pp_timing_interval == 0:
+            print(f"[PP TIMING] step={_step} RANK={g_rank_pt} pp_rank={pp_rank_pt} | "
+                  f"warmup={(_warmup_end-_warmup_start)*1000:.0f}ms | "
+                  f"1f1b={(_onef1b_end-_onef1b_start)*1000:.0f}ms | "
+                  f"cooldown={(_cooldown_end-_cooldown_start)*1000:.0f}ms | "
+                  f"total={(_cooldown_end-_warmup_start)*1000:.0f}ms",
+                  flush=True)
     # ═══ END CUSTOM LOG ═══
 
     if config.finalize_model_grads_func is not None and not forward_only:
