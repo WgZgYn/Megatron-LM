@@ -1663,19 +1663,17 @@ def get_tensor_shapes(
         tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
         # ═══ Half-layer PP: add second shape at split boundaries ═══
         if config.pipeline_split_layers is not None:
-            # Compute the cumulative full-layer count at the boundary after this rank.
-            # Supports both decoder_num_layers_per_pipeline_stage (full-layer) and
-            # decoder_num_half_layers_per_pipeline_stage (half-layer) distributions.
             if config.decoder_num_layers_per_pipeline_stage is not None:
-                stage_counts = config.decoder_num_layers_per_pipeline_stage
-                cumsum = sum(stage_counts[: rank + 1])
-            elif config.decoder_num_half_layers_per_pipeline_stage is not None:
-                # Each half-layer pair = one full layer.  Boundary is the full-layer
-                # count at the end of this stage: ceil(cumsum_half / 2).
-                half_cumsum = sum(config.decoder_num_half_layers_per_pipeline_stage[: rank + 1])
-                cumsum = (half_cumsum + 1) // 2  # ceil division
+                # With split_all_layers, counts half-layers; without, counts full layers.
+                # Either way, cumsum gives the boundary in the same units as pipeline_split_layers.
+                cumsum = sum(config.decoder_num_layers_per_pipeline_stage[: rank + 1])
+                if config.split_all_layers:
+                    # Convert half-layer cumsum to 1-based full-layer index for boundary check
+                    cumsum = ((cumsum + 1) // 2) if cumsum % 2 == 1 else (cumsum // 2)
+                # else: cumsum is already in full-layer units
             else:
-                cumsum = sum(1 for _ in range(rank + 1))  # fallback: uniform
+                # Uniform distribution fallback
+                cumsum = (rank + 1) * (config.num_layers // config.pipeline_model_parallel_size)
             if cumsum in config.pipeline_split_layers:
                 tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
         # ═══ END half-layer shape ═══

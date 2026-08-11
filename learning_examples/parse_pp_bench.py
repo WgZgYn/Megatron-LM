@@ -20,7 +20,6 @@ def parse_log(path):
     # --- Config from log content ---
     mode = "baseline"
     decoder_num_layers = None
-    decoder_num_half_layers = None
     pipeline_split_layers = None
 
     if '--split-all-layers' in text or 'split_all_layers' in text:
@@ -32,12 +31,13 @@ def parse_log(path):
             decoder_num_layers = [int(x) for x in m.group(1).split()]
         except: pass
 
-    m = re.search(r'--decoder-num-half-layers-per-pipeline-stage\s+([\d\s]+?)(?:\s+--|\s*\n|\s*$)', text)
-    if m:
-        try:
-            decoder_num_half_layers = [int(x) for x in m.group(1).split()]
-            mode = "half-layer"
-        except: pass
+    # Detect half-layer mode: split_all_layers + sum = num_layers*2
+    if mode == "split-all" and decoder_num_layers:
+        total = sum(decoder_num_layers)
+        # If the distribution would make sense as half-layers (sum ~ num_layers*2)
+        # we're in half-layer mode. Otherwise it's full-layer-with-internal-split.
+        if total == 12 * 2:  # 12 layers = 24 half-layers for current model
+            mode = "split-all(half)" if any(n % 2 == 1 for n in decoder_num_layers) else "split-all"
 
     m = re.search(r'--pipeline-split-layers\s+([\d\s]+?)(?:\s+--|\s*\n|\s*$)', text)
     if m:
@@ -100,9 +100,7 @@ def summarize(data):
     # Config string
     mode = data['mode']
     cfg = ""
-    if data['decoder_num_half_layers']:
-        cfg = f"half=[{','.join(map(str, data['decoder_num_half_layers']))}]"
-    elif data['decoder_num_layers']:
+    if data['decoder_num_layers']:
         cfg = f"full=[{','.join(map(str, data['decoder_num_layers']))}]"
     if mode == 'baseline':
         cfg = "uniform"

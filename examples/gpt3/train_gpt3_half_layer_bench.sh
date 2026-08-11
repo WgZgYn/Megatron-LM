@@ -59,20 +59,21 @@ run_exp 2 "pp2_split_uniform" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
     --split-all-layers
 
-# A3) Uneven (mild): 4+8 full → 8+16 half-layers
+# A3) Uneven (mild): 4+8 full layers per stage → 8+16 half-layers
 run_exp 2 "pp2_split_uneven_4_8" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
     --split-all-layers --decoder-num-layers-per-pipeline-stage 4 8
 
-# A4) Uneven (extreme): 3+9 full → 6+18 half-layers
+# A4) Uneven (extreme): 3+9 full layers → 6+18 half-layers
 run_exp 2 "pp2_split_uneven_3_9" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
     --split-all-layers --decoder-num-layers-per-pipeline-stage 3 9
 
 # A5) Half-layer granularity: 11+13 half-layers, auto-split at layer 6
+#     (split_all_layers changes units to half-layers, sum = 12*2 = 24)
 run_exp 2 "pp2_half_layer_11_13" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
-    --split-all-layers --decoder-num-half-layers-per-pipeline-stage 11 13
+    --split-all-layers --decoder-num-layers-per-pipeline-stage 11 13
 
 # ═══ PP=4 experiments ═══
 
@@ -89,10 +90,10 @@ run_exp 4 "pp4_split_uniform" \
     --split-all-layers
 
 # B3) Half-layer granularity: [5,7,6,6] half-layers → auto split at layer 3
-#     GPU0=5 halves, GPU1=7, GPU2=6, GPU3=6 (24 total)
+#     (split_all_layers changes units to half-layers, sum = 12*2 = 24)
 run_exp 4 "pp4_half_layer_5_7_6_6" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 4 \
-    --split-all-layers --decoder-num-half-layers-per-pipeline-stage 5 7 6 6
+    --split-all-layers --decoder-num-layers-per-pipeline-stage 5 7 6 6
 
 # B4) Uneven: [1,2,5,4] full layers → [2,4,10,8] half-layers
 #     stage0 light, stage2 heavy

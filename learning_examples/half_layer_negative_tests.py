@@ -154,77 +154,46 @@ except Exception as e:
 
 # --- New: decoder_num_half_layers_per_pipeline_stage tests ---
 
-# 10. half-layer dist without split_all_layers
+# 10. split_all_layers: half-layer sum wrong (must = num_layers*2)
 if test_should_fail(
-    "half-layer dist without split_all_layers",
-    split_all_layers=False,
-    decoder_num_half_layers_per_pipeline_stage=[6, 6, 6, 6],
-):
-    passed += 1
-else:
-    failed += 1
-
-# 11. half-layer dist sum != num_layers*2
-if test_should_fail(
-    "half-layer dist bad sum",
+    "split_all_layers bad half-layer sum",
     split_all_layers=True,
-    decoder_num_half_layers_per_pipeline_stage=[5, 7, 6, 5],
+    decoder_num_layers_per_pipeline_stage=[5, 7, 6, 5],  # sum=23, need 24
 ):
     passed += 1
 else:
     failed += 1
 
-# 12. half-layer dist wrong length
-if test_should_fail(
-    "half-layer dist wrong length",
-    split_all_layers=True,
-    decoder_num_half_layers_per_pipeline_stage=[12, 12],
-):
-    passed += 1
-else:
-    failed += 1
-
-# 13. half-layer dist with full-layer dist (mutual exclusion)
-if test_should_fail(
-    "half-layer + full-layer dist together",
-    split_all_layers=True,
-    decoder_num_half_layers_per_pipeline_stage=[6, 6, 6, 6],
-    decoder_num_layers_per_pipeline_stage=[3, 3, 3, 3],
-):
-    passed += 1
-else:
-    failed += 1
-
-# 14. valid half-layer dist (uniform, no cross-stage split)
+# 11. split_all_layers: valid uniform half-layer (no cross-stage split)
 try:
     cfg = TransformerConfig(
         num_layers=12, hidden_size=128, num_attention_heads=4,
         pipeline_model_parallel_size=4, pipeline_dtype=torch.float32,
         params_dtype=torch.float32,
         split_all_layers=True,
-        decoder_num_half_layers_per_pipeline_stage=[6, 6, 6, 6],
+        decoder_num_layers_per_pipeline_stage=[6, 6, 6, 6],
     )
-    assert cfg.pipeline_split_layers == []
-    print(f"  [PASS] half-layer uniform: no cross-stage splits")
+    assert cfg.pipeline_split_layers is None
+    print(f"  [PASS] split_all_layers uniform half-layer: no cross-stage splits")
     passed += 1
 except Exception as e:
-    print(f"  [FAIL] half-layer uniform raised: {e}")
+    print(f"  [FAIL] split_all_layers uniform half-layer: {e}")
     failed += 1
 
-# 15. valid half-layer dist with cross-stage split
+# 12. split_all_layers: valid uneven half-layer with auto cross-stage split
 try:
     cfg = TransformerConfig(
         num_layers=12, hidden_size=128, num_attention_heads=4,
         pipeline_model_parallel_size=4, pipeline_dtype=torch.float32,
         params_dtype=torch.float32,
         split_all_layers=True,
-        decoder_num_half_layers_per_pipeline_stage=[5, 7, 6, 6],
+        decoder_num_layers_per_pipeline_stage=[5, 7, 6, 6],
     )
     assert cfg.pipeline_split_layers == [3]
-    print(f"  [PASS] half-layer [5,7,6,6] -> auto split at layer 3")
+    print(f"  [PASS] split_all_layers [5,7,6,6] -> auto split at layer 3")
     passed += 1
 except Exception as e:
-    print(f"  [FAIL] half-layer [5,7,6,6] raised: {e}")
+    print(f"  [FAIL] split_all_layers [5,7,6,6]: {e}")
     failed += 1
 
 print(f"\n{'=' * 60}")
