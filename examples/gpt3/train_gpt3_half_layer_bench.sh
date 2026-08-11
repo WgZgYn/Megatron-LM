@@ -69,6 +69,12 @@ run_exp "pp2_split_uneven_3_9" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
     --split-all-layers --decoder-num-layers-per-pipeline-stage 3 9
 
+# A5) Half-layer granularity: GPU0=11 halves, GPU1=13 halves (= 5.5+6.5 full layers)
+#     auto-detects cross-stage split at layer 6 (prefix sum 11 is odd)
+run_exp "pp2_half_layer_11_13" \
+    --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
+    --split-all-layers --decoder-num-half-layers-per-pipeline-stage 11 13
+
 # ═══ PP=4 experiments ═══
 
 echo "=== PP=4: 3+3+3+3 full layers per stage ==="
@@ -83,7 +89,13 @@ run_exp "pp4_split_uniform" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 4 \
     --split-all-layers
 
-# B3) Uneven: [1,2,5,4] full layers → [2,4,10,8] half-layers
+# B3) Half-layer granularity: [5,7,6,6] half-layers → auto split at layer 3
+#     GPU0=5 halves, GPU1=7, GPU2=6, GPU3=6 (24 total)
+run_exp "pp4_half_layer_5_7_6_6" \
+    --tensor-model-parallel-size 1 --pipeline-model-parallel-size 4 \
+    --split-all-layers --decoder-num-half-layers-per-pipeline-stage 5 7 6 6
+
+# B4) Uneven: [1,2,5,4] full layers → [2,4,10,8] half-layers
 #     stage0 light, stage2 heavy
 run_exp "pp4_split_uneven" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 4 \
@@ -96,10 +108,12 @@ echo "  A1 baseline:     /tmp/pp_bench_pp2_baseline.log"
 echo "  A2 split uniform: /tmp/pp_bench_pp2_split_uniform.log"
 echo "  A3 split 4+8:    /tmp/pp_bench_pp2_split_uneven_4_8.log"
 echo "  A4 split 3+9:    /tmp/pp_bench_pp2_split_uneven_3_9.log"
+echo "  A5 half-layer 11+13: /tmp/pp_bench_pp2_half_layer_11_13.log"
 echo "PP=4 logs:"
 echo "  B1 baseline:     /tmp/pp_bench_pp4_baseline.log"
 echo "  B2 split uniform: /tmp/pp_bench_pp4_split_uniform.log"
-echo "  B3 split uneven:  /tmp/pp_bench_pp4_split_uneven.log"
+echo "  B3 half-layer 5+7+6+6: /tmp/pp_bench_pp4_half_layer_5_7_6_6.log"
+echo "  B4 split uneven:  /tmp/pp_bench_pp4_split_uneven.log"
 echo ""
 echo "Key numbers to compare (grep from logs):"
 echo "  'number of parameters'  → per-rank params"

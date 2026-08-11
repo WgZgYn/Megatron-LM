@@ -59,6 +59,13 @@ class TransformerConfig(ModelParallelConfig):
     No cross-stage split occurs — each stage simply runs twice as many half-layers.
     Mutually exclusive with ``pipeline_split_layers`` and VPP."""
 
+    decoder_num_half_layers_per_pipeline_stage: Optional[List[int]] = None
+    """Number of HALF-LAYERS (AttentionSubLayer / FFNSubLayer) on each pipeline
+    stage.  Requires ``split_all_layers=True``.  Sum must equal num_layers * 2.
+    Stage boundaries that split a full layer (odd prefix sum) automatically
+    generate cross-stage 2-tensor P2P communication for that layer.
+    Mutually exclusive with ``decoder_num_layers_per_pipeline_stage`` and VPP."""
+
     account_for_embedding_in_pipeline_split: bool = False
     """If set, the embedding layer will be treated as a standard transformer
     layer in the context of partition and placement for pipeline parallelism."""
@@ -916,21 +923,68 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 'split_all_layers and pipeline_split_layers are mutually exclusive'
             )
-        if self.pipeline_split_layers is not None:
+
+        # ═══ Half-layer PP: validate half-layer distribution ═══
+        if self.decoder_num_half_layers_per_pipeline_stage is not None:
+            if not self.split_all_layers:
+                raise ValueError(
+                    'decoder_num_half_layers_per_pipeline_stage requires split_all_layers=True'
+                )
+            if self.decoder_num_layers_per_pipeline_stage is not None:
+                raise ValueError(
+                    'decoder_num_half_layers_per_pipeline_stage and '
+                    'decoder_num_layers_per_pipeline_stage are mutually exclusive'
+                )
+            if self.virtual_pipeline_model_parallel_size is not None:
+                raise ValueError(
+                    'decoder_num_half_layers_per_pipeline_stage does not support VPP'
+                )
+            if len(self.decoder_num_half_layers_per_pipeline_stage) != self.pipeline_model_parallel_size:
+                raise ValueError(
+                    f'decoder_num_half_layers_per_pipeline_stage must have length equal to '
+                    f'pipeline_model_parallel_size ({self.pipeline_model_parallel_size}), '
+                    f'got {len(self.decoder_num_half_layers_per_pipeline_stage)}'
+                )
+            total_half = sum(self.decoder_num_half_layers_per_pipeline_stage)
+            expected = self.num_layers * 2
+            if total_half != expected:
+                raise ValueError(
+                    f'sum of decoder_num_half_layers_per_pipeline_stage ({total_half}) '
+                    f'must equal num_layers*2 ({expected})'
+                )
+            if not all(x > 0 for x in self.decoder_num_half_layers_per_pipeline_stage):
+                raise ValueError(
+                    'all entries of decoder_num_half_layers_per_pipeline_stage must be > 0'
+                )
+            # Auto-derive pipeline_split_layers from odd prefix sums.
+            # An odd cumulative count means a full layer is split across stages.
+            cumsum = 0
+            auto_splits = []
+            for i, n in enumerate(self.decoder_num_half_layers_per_pipeline_stage[:-1]):
+                cumsum += n
+                if cumsum % 2 == 1:  # cuts through a full layer
+                    auto_splits.append((cumsum + 1) // 2)  # 1-based full-layer index
+            self.pipeline_split_layers = auto_splits
+            import torch as _torch
+            if not _torch.distributed.is_initialized() or _torch.distributed.get_rank() == 0:
+                print(
+                    f'[half-layer PP] auto-derived pipeline_split_layers={auto_splits} '
+                    f'from half-layer distribution {list(self.decoder_num_half_layers_per_pipeline_stage)}',
+                    flush=True,
+                )
+
+        # Validate user-specified pipeline_split_layers (skip when auto-derived from half-layer distrib)
+        if self.pipeline_split_layers is not None and self.decoder_num_half_layers_per_pipeline_stage is None:
             if self.decoder_num_layers_per_pipeline_stage is None:
                 raise ValueError(
                     'pipeline_split_layers requires decoder_num_layers_per_pipeline_stage '
                     'to determine stage boundaries'
                 )
-            if self.virtual_pipeline_model_parallel_size is not None:
-                raise ValueError(
-                    'pipeline_split_layers does not support virtual pipeline parallelism (VPP)'
-                )
             if self.recompute_granularity == 'full':
                 raise ValueError(
                     'pipeline_split_layers does not support recompute_granularity=full'
                 )
-            # Compute valid split positions: each is sum(dist[:k+1]) for some stage k
+            # Compute valid split positions from cumulative full-layer counts
             cumsum = 0
             valid_boundaries = set()
             for n in self.decoder_num_layers_per_pipeline_stage[:-1]:
