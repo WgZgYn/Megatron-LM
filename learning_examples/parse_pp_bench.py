@@ -119,15 +119,10 @@ def summarize(data):
     else:
         mem_str = "N/A"
 
-    # Params
-    params_str = f"{data['total_params']:.0f}M" if data['total_params'] else "N/A"
-
-    # PP and bubble
     pp = data.get('pp_size', '?')
-    bubble_str = f"b={data['bubble_est']:.0f}%" if data['bubble_est'] else ""
 
-    return (f"{data['name']:28s} {params_str:>5s}  {mem_str:>12s}  {time_str:>8s}  "
-            f"PP={pp}  {mode:12s}  {cfg:20s}  {bubble_str}")
+    return (f"{data['name']:28s}  {mem_str:>12s}  {time_str:>8s}  "
+            f"PP={pp}  {mode:12s}  {cfg}")
 
 
 def main():
@@ -136,8 +131,8 @@ def main():
         print("No log files. Usage: python parse_pp_bench.py <log1> [log2 ...]")
         sys.exit(1)
 
-    header = (f"{'Config':28s} {'Params':>5s}  {'Memory':>12s}  {'Time(median)':>8s}  "
-              f"{'PP':>4s}  {'Mode':12s}  {'Distribution':20s}  Bubble")
+    header = (f"{'Config':28s}  {'Memory':>12s}  {'Time(median)':>8s}  "
+              f"{'PP':>4s}  {'Mode':12s}  {'Distribution'}")
     print(header)
     print("-" * len(header))
 
