@@ -1807,6 +1807,7 @@ def forward_backward_pipelining_without_interleaving(
         print(f"[HALF-CFG] RANK={g_r} split_all={config.split_all_layers} "
               f"pipeline_split_layers={config.pipeline_split_layers} "
               f"decoder_dist={config.decoder_num_layers_per_pipeline_stage} "
+              f"half_dist={config.decoder_num_half_layers_per_pipeline_stage} "
               f"num_layers={config.num_layers}", flush=True)
     # ═══ END half-layer config debug ═══
 

@@ -8,7 +8,10 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_layer_local_spec,
+)
 from megatron.core.pipeline_parallel.pipeline_partition import (
     build_pipeline_stage_partitions,
     get_cross_stage_split_layers,
@@ -21,7 +24,7 @@ from megatron.core.pipeline_parallel.schedules import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_sublayer import AttentionSubLayer, FFNSubLayer
-from megatron.core.transformer.transformer_block import TransformerBlock
+from megatron.core.transformer.transformer_block import TransformerBlock, _get_block_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -91,6 +94,21 @@ def test_real_gpt_spec_starts_second_stage_with_ffn(monkeypatch):
         4,
         4,
     ]
+
+
+def test_pretrain_dense_layer_spec_uses_half_layer_partition(monkeypatch):
+    """pretrain_gpt.py passes a layer spec, rather than a decoder block spec."""
+    config = _make_config(
+        num_layers=12,
+        split_all_layers=True,
+        decoder_num_half_layers_per_pipeline_stage=[11, 13],
+    )
+    monkeypatch.setattr(parallel_state, 'get_pipeline_model_parallel_rank', lambda: 0)
+    block_submodules = _get_block_submodules(config, get_gpt_layer_local_spec())
+
+    assert len(block_submodules.layer_specs) == 11
+    assert block_submodules.layer_specs[-1].module is AttentionSubLayer
+    assert block_submodules.layer_specs[-1].params['global_layer_number'] == 6
 
 
 def test_transformer_block_builds_uniform_logical_layer_sequence(monkeypatch):

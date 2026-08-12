@@ -18,6 +18,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_sublayer import AttentionSubLayer, FFNSubLayer
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
@@ -188,6 +189,81 @@ class TransformerBlockSubmodules:
     layer_norm: Optional[Union[ModuleSpec, torch.nn.Module]] = None
 
 
+def get_pipeline_layer_specs(
+    config: TransformerConfig, layer_specs: List[ModuleSpec]
+) -> List[ModuleSpec]:
+    """Select and, when needed, split the full-layer specs for this PP stage."""
+    if len(layer_specs) != config.num_layers:
+        raise ValueError(
+            f'expected {config.num_layers} global layer specs, got {len(layer_specs)}'
+        )
+
+    if config.split_all_layers:
+        # Local import avoids transformer_block -> pipeline_parallel.__init__ -> schedules
+        # -> multi_token_prediction -> transformer_block during module initialization.
+        from megatron.core.pipeline_parallel.pipeline_partition import (
+            get_pipeline_stage_partition,
+        )
+
+        partition = get_pipeline_stage_partition(
+            config, parallel_state.get_pipeline_model_parallel_rank()
+        )
+        assert partition is not None
+        stage_specs = []
+        for half_layer_index in range(partition.half_start, partition.half_end):
+            full_layer_index = half_layer_index // 2
+            full_spec = layer_specs[full_layer_index]
+            stage_specs.append(
+                ModuleSpec(
+                    module=(
+                        AttentionSubLayer if half_layer_index % 2 == 0 else FFNSubLayer
+                    ),
+                    params={
+                        **full_spec.params,
+                        'global_layer_number': full_layer_index + 1,
+                    },
+                    submodules=full_spec.submodules,
+                )
+            )
+        return stage_specs
+
+    offset = get_transformer_layer_offset(config)
+    num_layers_to_build = get_num_layers_to_build(config)
+    if config.pipeline_split_layers is None:
+        return layer_specs[offset : offset + num_layers_to_build]
+
+    start_layer = offset + 1
+    end_layer = offset + num_layers_to_build
+    stage_specs = []
+    previous_layer = start_layer - 1
+    if previous_layer in config.pipeline_split_layers:
+        full_spec = layer_specs[previous_layer - 1]
+        stage_specs.append(
+            ModuleSpec(
+                module=FFNSubLayer,
+                params={**full_spec.params, 'global_layer_number': previous_layer},
+                submodules=full_spec.submodules,
+            )
+        )
+
+    for global_layer_number in range(start_layer, end_layer + 1):
+        full_spec = layer_specs[global_layer_number - 1]
+        if global_layer_number in config.pipeline_split_layers:
+            stage_specs.append(
+                ModuleSpec(
+                    module=AttentionSubLayer,
+                    params={
+                        **full_spec.params,
+                        'global_layer_number': global_layer_number,
+                    },
+                    submodules=full_spec.submodules,
+                )
+            )
+        else:
+            stage_specs.append(full_spec)
+    return stage_specs
+
+
 def _get_block_submodules(
     config: TransformerConfig, spec: Union[TransformerBlockSubmodules, ModuleSpec]
 ) -> TransformerBlockSubmodules:
@@ -215,9 +291,9 @@ def _get_block_submodules(
         if issubclass(spec.module, TransformerBlock):
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
-            num_layers = get_num_layers_to_build(config)
             return TransformerBlockSubmodules(
-                layer_specs=[spec] * num_layers, layer_norm=LayerNormImpl
+                layer_specs=get_pipeline_layer_specs(config, [spec] * config.num_layers),
+                layer_norm=LayerNormImpl,
             )
         else:
             raise Exception(f"specialize for {spec.module.__name__}.")
