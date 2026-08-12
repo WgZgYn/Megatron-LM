@@ -1,5 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -386,31 +387,31 @@ def _communicate(
         else:
             reqs.update(p2p_reqs)
 
+    trace_p2p = os.environ.get('LOG_P2P_COMMS', '0') == '1'
+    if trace_p2p:
+        if not hasattr(_communicate, '_trace_counts'):
+            _communicate._trace_counts = {}
+        global_rank = torch.distributed.get_rank()
+        trace_id = _communicate._trace_counts.get(global_rank, 0)
+        _communicate._trace_counts[global_rank] = trace_id + 1
+
+        def describe(tensor):
+            return '-' if tensor is None else 'x'.join(str(dim) for dim in tensor.shape)
+
+        print(
+            f'[P2P-BEGIN] rank={global_rank} seq={trace_id} '
+            f'send_prev={describe(tensor_send_prev)} recv_prev={describe(tensor_recv_prev)} '
+            f'send_next={describe(tensor_send_next)} recv_next={describe(tensor_recv_next)}',
+            flush=True,
+        )
+
     if wait_on_reqs and len(reqs) > 0:
         for req in reqs if isinstance(reqs, list) else reqs.values():
             req.wait()
         reqs = None
 
-    # ═══ CUSTOM LOG: P2P communication trace (env: LOG_P2P_COMMS=1) ═══
-    import os as _os
-    if _os.environ.get('LOG_P2P_COMMS', '0') == '1':
-        g_rank = torch.distributed.get_rank()
-        pp_rank = get_pipeline_model_parallel_rank()
-        next_r = get_pipeline_model_parallel_next_rank()
-        prev_r = get_pipeline_model_parallel_prev_rank()
-        actions = []
-        if tensor_send_next is not None:
-            actions.append(f"send→rank{next_r[0] if isinstance(next_r, list) else next_r}")
-        if tensor_recv_prev is not None:
-            actions.append(f"recv←rank{prev_r[0] if isinstance(prev_r, list) else prev_r}")
-        if tensor_send_prev is not None:
-            actions.append(f"send→rank{prev_r[0] if isinstance(prev_r, list) else prev_r}")
-        if tensor_recv_next is not None:
-            actions.append(f"recv←rank{next_r[0] if isinstance(next_r, list) else next_r}")
-        if tensor_send_next is not None:
-            sz = tensor_send_next.numel() * tensor_send_next.element_size() / 1024 / 1024
-            print(f"[P2P] RANK={g_rank} pp={pp_rank} | {'|'.join(actions)} | {sz:.1f}MB", flush=True)
-    # ═══ END CUSTOM LOG ═══
+    if trace_p2p:
+        print(f'[P2P-END] rank={global_rank} seq={trace_id}', flush=True)
 
     if (
         (config.batch_p2p_comm and config.batch_p2p_sync)

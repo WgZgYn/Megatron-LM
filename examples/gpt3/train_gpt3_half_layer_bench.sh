@@ -38,6 +38,9 @@ EVAL_ARGS=(--log-interval 1 --eval-interval 100 --eval-iters 0)
 
 run_exp() {
     local gpus="$1"; local label="$2"; shift 2
+    if [ -n "${ONLY_EXPERIMENT:-}" ] && [ "$ONLY_EXPERIMENT" != "$label" ]; then
+        return
+    fi
     echo "==== $label (${gpus} GPUs, DP=1, TP=1) ===="
     torchrun --nproc_per_node $gpus ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
         ${GPT_MODEL_ARGS[@]} ${TRAINING_ARGS[@]} "$@" ${DATA_ARGS[@]} ${EVAL_ARGS[@]} \
