@@ -16,6 +16,8 @@ from megatron.core.pipeline_parallel.schedules import (
     custom_backward,
     deallocate_output_tensor,
     get_tensor_shapes,
+    send_backward_recv_forward,
+    send_forward_recv_backward,
 )
 from megatron.core.transformer.transformer_sublayer import AttentionSubLayer, FFNSubLayer
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -155,3 +157,48 @@ def test_multi_output_custom_backward_after_deallocation():
     deallocate_output_tensor([first, second], deallocate_pipeline_outputs=True)
     custom_backward([first, second], [torch.tensor(7.0), torch.tensor(11.0)])
     assert source.grad.item() == 76.0
+
+
+def test_multi_tensor_1f1b_uses_one_batched_p2p_transaction(monkeypatch):
+    """Sequential combined calls deadlock across a two-tensor boundary."""
+    shapes = [(8, 2, 64), (8, 2, 64)]
+    outputs = [torch.tensor(1.0), torch.tensor(2.0)]
+    grads = [torch.tensor(3.0), torch.tensor(4.0)]
+    calls = []
+
+    def fail_single(*args, **kwargs):
+        raise AssertionError('single-tensor combined P2P must not be used')
+
+    def forward_multi(tensors, tensor_shapes, config):
+        calls.append(('forward', tensors, tensor_shapes))
+        return grads
+
+    def backward_multi(tensors, tensor_shapes, config):
+        calls.append(('backward', tensors, tensor_shapes))
+        return outputs
+
+    monkeypatch.setattr(
+        'megatron.core.pipeline_parallel.schedules.p2p_communication.'
+        'send_forward_recv_backward',
+        fail_single,
+    )
+    monkeypatch.setattr(
+        'megatron.core.pipeline_parallel.schedules.p2p_communication.'
+        'send_backward_recv_forward',
+        fail_single,
+    )
+    monkeypatch.setattr(
+        'megatron.core.pipeline_parallel.schedules.p2p_communication.'
+        'send_forward_recv_backward_multi',
+        forward_multi,
+    )
+    monkeypatch.setattr(
+        'megatron.core.pipeline_parallel.schedules.p2p_communication.'
+        'send_backward_recv_forward_multi',
+        backward_multi,
+    )
+
+    config = object()
+    assert send_forward_recv_backward(outputs, shapes, config) == grads
+    assert send_backward_recv_forward(grads, shapes, config) == outputs
+    assert [call[0] for call in calls] == ['forward', 'backward']

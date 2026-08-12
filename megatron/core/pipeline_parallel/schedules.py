@@ -1740,6 +1740,11 @@ def send_forward_recv_backward(output_tensors, tensor_shapes, config):
     with non-interleaving schedule."""
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
+    if len(output_tensors) > 1:
+        assert len(output_tensors) == len(tensor_shapes)
+        return p2p_communication.send_forward_recv_backward_multi(
+            output_tensors, tensor_shapes, config
+        )
     output_tensor_grads = []
     for output_tensor, tensor_shape in zip(output_tensors, tensor_shapes):
         if tensor_shape is None:
@@ -1757,6 +1762,11 @@ def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config):
     with non-interleaving schedule."""
     if not isinstance(input_tensor_grads, list):
         input_tensor_grads = [input_tensor_grads]
+    if len(input_tensor_grads) > 1:
+        assert len(input_tensor_grads) == len(tensor_shapes)
+        return p2p_communication.send_backward_recv_forward_multi(
+            input_tensor_grads, tensor_shapes, config
+        )
     input_tensors = []
     for input_tensor_grad, tensor_shape in zip(input_tensor_grads, tensor_shapes):
         if tensor_shape is None:

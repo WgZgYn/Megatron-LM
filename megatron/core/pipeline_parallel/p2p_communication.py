@@ -560,6 +560,96 @@ def send_forward_recv_backward(
     return output_tensor_grad
 
 
+def _communicate_multi_tensor_boundary(
+    *,
+    tensors_send_next=None,
+    tensors_send_prev=None,
+    recv_prev_shapes=None,
+    recv_next_shapes=None,
+    config: ModelParallelConfig,
+):
+    """Submit every tensor at a split-layer boundary as one P2P batch.
+
+    Calling ``send_forward_recv_backward`` once per tensor can deadlock: one
+    rank waits for the first backward gradient while its peer is still waiting
+    for the second forward activation. Grouping all operations removes that
+    cross-tensor ordering dependency.
+    """
+
+    if config.variable_seq_lengths:
+        raise RuntimeError(
+            'multi-tensor pipeline boundaries do not support variable sequence lengths'
+        )
+
+    tensors_send_next = list(tensors_send_next or [])
+    tensors_send_prev = list(tensors_send_prev or [])
+    recv_prev_shapes = list(recv_prev_shapes or [])
+    recv_next_shapes = list(recv_next_shapes or [])
+
+    pp_group = get_pipeline_model_parallel_group()
+    next_rank = get_pipeline_model_parallel_next_rank()
+    prev_rank = get_pipeline_model_parallel_prev_rank()
+    if isinstance(pp_group, list):
+        raise RuntimeError(
+            'multi-tensor pipeline boundaries currently require a single pipeline group'
+        )
+
+    recv_prev_tensors = [
+        torch.empty(
+            shape,
+            requires_grad=True,
+            device=torch.cuda.current_device(),
+            dtype=config.pipeline_dtype,
+        )
+        for shape in recv_prev_shapes
+    ]
+    recv_next_tensors = [
+        torch.empty(
+            shape,
+            requires_grad=True,
+            device=torch.cuda.current_device(),
+            dtype=config.pipeline_dtype,
+        )
+        for shape in recv_next_shapes
+    ]
+
+    ops = []
+    ops.extend(
+        torch.distributed.P2POp(torch.distributed.isend, tensor, prev_rank, pp_group)
+        for tensor in tensors_send_prev
+    )
+    ops.extend(
+        torch.distributed.P2POp(torch.distributed.irecv, tensor, prev_rank, pp_group)
+        for tensor in recv_prev_tensors
+    )
+    ops.extend(
+        torch.distributed.P2POp(torch.distributed.isend, tensor, next_rank, pp_group)
+        for tensor in tensors_send_next
+    )
+    ops.extend(
+        torch.distributed.P2POp(torch.distributed.irecv, tensor, next_rank, pp_group)
+        for tensor in recv_next_tensors
+    )
+    if ops:
+        for request in torch.distributed.batch_isend_irecv(ops):
+            request.wait()
+
+    return recv_prev_tensors, recv_next_tensors
+
+
+def send_forward_recv_backward_multi(output_tensors, tensor_shapes, config):
+    """Send all forward outputs and receive all matching gradients atomically."""
+
+    if core.parallel_state.is_pipeline_last_stage():
+        return [None] * len(output_tensors)
+    _, output_tensor_grads = _communicate_multi_tensor_boundary(
+        tensors_send_next=output_tensors,
+        recv_next_shapes=tensor_shapes,
+        config=config,
+    )
+    return output_tensor_grads
+
+
 def send_backward_recv_forward(
     input_tensor_grad: torch.Tensor, tensor_shape: Shape, config: ModelParallelConfig
 ) -> torch.Tensor:
@@ -583,6 +673,19 @@ def send_backward_recv_forward(
         if config.timers is not None:
             config.timers('backward-send-forward-recv').stop()
     return input_tensor
+
+
+def send_backward_recv_forward_multi(input_tensor_grads, tensor_shapes, config):
+    """Send all input gradients and receive the next forward inputs atomically."""
+
+    if core.parallel_state.is_pipeline_first_stage():
+        return [None] * len(input_tensor_grads)
+    input_tensors, _ = _communicate_multi_tensor_boundary(
+        tensors_send_prev=input_tensor_grads,
+        recv_prev_shapes=tensor_shapes,
+        config=config,
+    )
+    return input_tensors
 
 
 def send_forward_recv_forward(
