@@ -391,6 +391,27 @@ def _communicate(
             req.wait()
         reqs = None
 
+    # ═══ CUSTOM LOG: P2P communication trace (env: LOG_P2P_COMMS=1) ═══
+    import os as _os
+    if _os.environ.get('LOG_P2P_COMMS', '0') == '1':
+        g_rank = torch.distributed.get_rank()
+        pp_rank = get_pipeline_model_parallel_rank()
+        next_r = get_pipeline_model_parallel_next_rank()
+        prev_r = get_pipeline_model_parallel_prev_rank()
+        actions = []
+        if tensor_send_next is not None:
+            actions.append(f"send→rank{next_r[0] if isinstance(next_r, list) else next_r}")
+        if tensor_recv_prev is not None:
+            actions.append(f"recv←rank{prev_r[0] if isinstance(prev_r, list) else prev_r}")
+        if tensor_send_prev is not None:
+            actions.append(f"send→rank{prev_r[0] if isinstance(prev_r, list) else prev_r}")
+        if tensor_recv_next is not None:
+            actions.append(f"recv←rank{next_r[0] if isinstance(next_r, list) else next_r}")
+        if tensor_send_next is not None:
+            sz = tensor_send_next.numel() * tensor_send_next.element_size() / 1024 / 1024
+            print(f"[P2P] RANK={g_rank} pp={pp_rank} | {'|'.join(actions)} | {sz:.1f}MB", flush=True)
+    # ═══ END CUSTOM LOG ═══
+
     if (
         (config.batch_p2p_comm and config.batch_p2p_sync)
         # The lists below have a size > 1 only when ETP ≠ DTP,

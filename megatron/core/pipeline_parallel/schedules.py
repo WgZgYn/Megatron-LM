@@ -9,6 +9,7 @@ from torch.autograd.variable import Variable
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
+from megatron.core.pipeline_parallel.pipeline_partition import get_pipeline_stage_partition
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
@@ -122,6 +123,10 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     '''
     if (out is None) or (not deallocate_pipeline_outputs):
         return
+    if isinstance(out, (list, tuple)):
+        for tensor in out:
+            deallocate_output_tensor(tensor, deallocate_pipeline_outputs=True)
+        return
     assert isinstance(out, torch.Tensor), "expected Tensor, found %s." % type(out).__name__
     assert out._base is None, "counter-productive to free a view of another tensor."
     out.data = torch.empty((1,), device=out.device, dtype=out.dtype)
@@ -136,21 +141,25 @@ def custom_backward(output, grad_output):
     grad have the same shape, while C++'s 'backward' does not.
     '''
 
-    assert output.numel() == 1, "output should be pseudo-'freed' in schedule, to optimize memory"
-    assert isinstance(output, torch.Tensor), "output == '%s'." % type(output).__name__
-    assert isinstance(grad_output, (torch.Tensor, type(None))), (
-        "grad_output == '%s'." % type(grad_output).__name__
-    )
+    outputs = list(output) if isinstance(output, (list, tuple)) else [output]
+    grad_outputs = list(grad_output) if isinstance(grad_output, (list, tuple)) else [grad_output]
+    assert len(outputs) == len(grad_outputs)
 
-    # Handle scalar output
-    if grad_output is None:
-        assert output.numel() == 1, "implicit grad requires scalar output."
-        grad_output = torch.ones_like(output, memory_format=torch.preserve_format)
+    normalized_grads = []
+    for tensor, grad in zip(outputs, grad_outputs):
+        assert isinstance(tensor, torch.Tensor), "output == '%s'." % type(tensor).__name__
+        assert tensor.numel() == 1, "output should be pseudo-'freed' in schedule"
+        assert isinstance(grad, (torch.Tensor, type(None))), (
+            "grad_output == '%s'." % type(grad).__name__
+        )
+        normalized_grads.append(
+            torch.ones_like(tensor, memory_format=torch.preserve_format) if grad is None else grad
+        )
 
     # Call c++ engine [ see torch/csrc/autograd/python_engine.cpp ]
     Variable._execution_engine.run_backward(
-        tensors=(output,),
-        grad_tensors=(grad_output,),
+        tensors=tuple(outputs),
+        grad_tensors=tuple(normalized_grads),
         keep_graph=False,
         create_graph=False,
         inputs=tuple(),
@@ -344,9 +353,22 @@ def forward_step(
     ):
         return [output_tensor, input_tensor[-1]], num_tokens
 
+    # ═══ Half-layer PP: normalize tuple output to flat list ═══
+    # If a stage ends with AttentionSubLayer, the model returns a tuple
+    # (pre_mlp_layernorm_output, residual) which must become a flat list
+    # of 2 tensors so the PP schedule wrappers process each one correctly.
+    if isinstance(output_tensor, tuple):
+        output_tensor = list(output_tensor)
+
     if unwrap_output_tensor:
+        # Normal stage, single tensor → return as-is (original behavior)
+        if not isinstance(output_tensor, list):
+            return output_tensor, num_tokens
+        # Half-layer PP: multi-tensor list, don't unwrap
         return output_tensor, num_tokens
-    return [output_tensor], num_tokens
+    # input was already a list → wrap if not already a list
+    return output_tensor if isinstance(output_tensor, list) else [output_tensor], num_tokens
+    # ═══ END half-layer normalization ═══
 
 
 def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
@@ -388,11 +410,25 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     # will not participate in the computation.
     # This results in a tensor that does not require gradients.
     # In such cases, we intentionally skip the backward pass while preserving zero gradients.
-    if output_tensor[0].requires_grad:
+    # ═══ Half-layer PP: multi-tensor backward ═══
+    # When a stage starts with FFNSubLayer, output_tensor_grad may be a list
+    # of 2 tensors. Filter to only tensors that require grad.
+    output_grad_pairs = [
+        (tensor, output_tensor_grad[index] if index < len(output_tensor_grad) else None)
+        for index, tensor in enumerate(output_tensor)
+        if tensor is not None and tensor.requires_grad
+    ]
+    grad_outputs = [pair[0] for pair in output_grad_pairs]
+    grad_tensors = [pair[1] for pair in output_grad_pairs]
+    if len(grad_outputs) > 0:
         if config.deallocate_pipeline_outputs:
-            custom_backward(output_tensor[0], output_tensor_grad[0])
+            custom_backward(grad_outputs, grad_tensors)
         else:
-            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+            torch.autograd.backward(
+                grad_outputs,
+                grad_tensors=grad_tensors if any(g is not None for g in grad_tensors) else None,
+            )
+    # ═══ END half-layer backward ═══
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -1637,6 +1673,23 @@ def get_tensor_shapes(
             tensor_shapes.append((decoder_seq_length, micro_batch_size, config.hidden_size))
     else:  # model_type == ModelType.encoder_or_decoder
         tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
+        # ═══ Half-layer PP: add second shape at split boundaries ═══
+        if config.split_all_layers:
+            # Attention produces (normalized_output, residual). Both ranks derive
+            # this two-tensor boundary from the same canonical partition plan.
+            partition = get_pipeline_stage_partition(config, rank)
+            if partition is not None and partition.ends_with_attention:
+                tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
+        elif config.pipeline_split_layers is not None:
+            if config.decoder_num_layers_per_pipeline_stage is not None:
+                boundary_layer = sum(config.decoder_num_layers_per_pipeline_stage[: rank + 1])
+            else:
+                boundary_layer = (rank + 1) * (
+                    config.num_layers // config.pipeline_model_parallel_size
+                )
+            if boundary_layer in config.pipeline_split_layers:
+                tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
+        # ═══ END half-layer shape ═══
     return tensor_shapes
 
 
@@ -1787,6 +1840,34 @@ def forward_backward_pipelining_without_interleaving(
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
 
+    # ═══ Half-layer PP: debug config values on first step ═══
+    import os as _os_cfg
+    if _os_cfg.environ.get('MEGATRON_DEBUG_LOG', '0') == '1':
+        g_r = torch.distributed.get_rank()
+        print(f"[HALF-CFG] RANK={g_r} split_all={config.split_all_layers} "
+              f"pipeline_split_layers={config.pipeline_split_layers} "
+              f"decoder_dist={config.decoder_num_layers_per_pipeline_stage} "
+              f"num_layers={config.num_layers}", flush=True)
+    # ═══ END half-layer config debug ═══
+
+    # ═══ CUSTOM LOG: PP schedule parameters (env: MEGATRON_DEBUG_LOG=1) ═══
+    import os as _os3
+    if not hasattr(forward_backward_pipelining_without_interleaving, "_step_count"):
+        forward_backward_pipelining_without_interleaving._step_count = 0
+    if _os3.environ.get('MEGATRON_DEBUG_LOG', '0') == '1' and forward_backward_pipelining_without_interleaving._step_count == 0:
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+        g_rank = torch.distributed.get_rank()
+        if g_rank == 0 or pp_rank == 0:
+            print(f"[PP SCHEDULE] global_rank={g_rank} pp_rank={pp_rank}/{pp_size} | "
+                  f"total_mb={num_microbatches} | "
+                  f"warmup={num_warmup_microbatches} | "
+                  f"1f1b={num_microbatches_remaining} | "
+                  f"cooldown={num_warmup_microbatches} | "
+                  f"bubble_est={(pp_size-1)/num_microbatches*100:.1f}%",
+                  flush=True)
+    # ═══ END CUSTOM LOG ═══
+
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
     # Micro-batches with the ids less than 'num_microbatches_with_partial_activation_checkpoints'
@@ -1832,6 +1913,13 @@ def forward_backward_pipelining_without_interleaving(
         output_tensors = []
     forward_data_store = []
 
+    # ═══ CUSTOM LOG: phase timing ═══
+    import time as _time
+    g_rank_pt = torch.distributed.get_rank()
+    pp_rank_pt = parallel_state.get_pipeline_model_parallel_rank()
+    _warmup_start = _time.time()
+    # ═══ END CUSTOM LOG ═══
+
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         # Decide to checkpoint all layers' activations of the current micro-batch
@@ -1864,7 +1952,12 @@ def forward_backward_pipelining_without_interleaving(
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+
+    # ═══ CUSTOM LOG: warmup→1f1b transition ═══
+    _warmup_end = _time.time()
+    _onef1b_start = _time.time()
+    # ═══ END CUSTOM LOG ═══
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
@@ -1916,7 +2009,7 @@ def forward_backward_pipelining_without_interleaving(
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.
@@ -1940,6 +2033,11 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor = send_backward_recv_forward(
                     input_tensor_grad, recv_tensor_shapes, config
                 )
+
+    # ═══ CUSTOM LOG: 1f1b→cooldown transition ═══
+    _onef1b_end = _time.time()
+    _cooldown_start = _time.time()
+    # ═══ END CUSTOM LOG ═══
 
     # Run cooldown backward passes.
     if not forward_only:
@@ -1970,6 +2068,24 @@ def forward_backward_pipelining_without_interleaving(
             enable_grad_sync()
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
+
+    # ═══ CUSTOM LOG: phase timing summary (env: MEGATRON_DEBUG_LOG=1) ═══
+    _cooldown_end = _time.time()
+    import os as _os4
+    if _os4.environ.get('MEGATRON_DEBUG_LOG', '0') == '1':
+        _pp_timing_interval = int(_os4.environ.get("PP_TIMING_INTERVAL", "10"))
+        if not hasattr(forward_backward_pipelining_without_interleaving, "_step_count"):
+            forward_backward_pipelining_without_interleaving._step_count = 0
+        _step = forward_backward_pipelining_without_interleaving._step_count
+        forward_backward_pipelining_without_interleaving._step_count += 1
+        if _step % _pp_timing_interval == 0:
+            print(f"[PP TIMING] step={_step} RANK={g_rank_pt} pp_rank={pp_rank_pt} | "
+                  f"warmup={(_warmup_end-_warmup_start)*1000:.0f}ms | "
+                  f"1f1b={(_onef1b_end-_onef1b_start)*1000:.0f}ms | "
+                  f"cooldown={(_cooldown_end-_cooldown_start)*1000:.0f}ms | "
+                  f"total={(_cooldown_end-_warmup_start)*1000:.0f}ms",
+                  flush=True)
+    # ═══ END CUSTOM LOG ═══
 
     if config.finalize_model_grads_func is not None and not forward_only:
 

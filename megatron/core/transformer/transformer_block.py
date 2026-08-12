@@ -18,6 +18,10 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_sublayer import (
+    AttentionSubLayer,
+    FFNSubLayer,
+)
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
@@ -58,6 +62,14 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
     Returns:
         int: The number of layers to be built for the current pipeline stage.
     """
+    if config.decoder_num_layers_per_pipeline_stage is not None:
+        pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
+        if not parallel_state.is_inside_encoder():
+            pp_decoder_start = parallel_state.get_pipeline_model_parallel_decoder_start()
+            if pp_decoder_start is not None:
+                pipeline_rank = pipeline_rank - pp_decoder_start
+        return config.decoder_num_layers_per_pipeline_stage[pipeline_rank]
+
     if (
         config.num_layers_in_first_pipeline_stage is not None
         or config.num_layers_in_last_pipeline_stage is not None
@@ -275,9 +287,18 @@ class TransformerBlock(MegatronModule):
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
         def build_layer(layer_spec, layer_number):
-            global_layer_number = layer_number + get_transformer_layer_offset(
-                self.config
+            # ═══ Half-layer PP: use explicitly-stamped global_layer_number ═══
+            explicit_global = (
+                layer_spec.params.get("global_layer_number")
+                if isinstance(layer_spec, ModuleSpec) and layer_spec.params is not None
+                else None
+            )
+            global_layer_number = (
+                explicit_global
+                if explicit_global is not None
+                else layer_number + get_transformer_layer_offset(self.config)
             )  # 1-based index
+            # ═══ END half-layer numbering ═══
             if self.config.heterogeneous_block_specs:
                 layer_config = self.config.get_config_for_layer(global_layer_number)
             else:
@@ -467,9 +488,17 @@ class TransformerBlock(MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
+        # ═══ Half-layer PP: unpack 2-tensor input for stages starting with FFNSubLayer ═══
+        pending_mlp_input = None
         if not self.pre_process:
             # See set_input_tensor()
-            hidden_states = self.input_tensor
+            if isinstance(self.input_tensor, list) and len(self.input_tensor) == 2:
+                # Stage begins with FFN half: (pre_mlp_layernorm_output, residual)
+                pending_mlp_input = (self.input_tensor[0], self.input_tensor[1])
+                hidden_states = self.input_tensor[1]
+            else:
+                hidden_states = self.input_tensor
+        # ═══ END half-layer input unpack ═══
 
         # Update the inference parameters with the current batch size in case it is variable
         if inference_context and not self.training:
@@ -526,19 +555,43 @@ class TransformerBlock(MegatronModule):
                         else nullcontext()
                     )
                     with self.offload_context, inner_fp8_context:
-                        hidden_states, context = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            rotary_pos_cos=rotary_pos_cos,
-                            rotary_pos_sin=rotary_pos_sin,
-                            attention_bias=attention_bias,
-                            inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
-                            sequence_len_offset=sequence_len_offset,
-                        )
+                        # ═══ Half-layer PP: 3-way dispatch ═══
+                        if isinstance(layer, AttentionSubLayer):
+                            pre_mlp_layernorm_output, residual, context = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                context=context,
+                                context_mask=context_mask,
+                                rotary_pos_emb=rotary_pos_emb,
+                                rotary_pos_cos=rotary_pos_cos,
+                                rotary_pos_sin=rotary_pos_sin,
+                                attention_bias=attention_bias,
+                                inference_context=inference_context,
+                                packed_seq_params=packed_seq_params,
+                                sequence_len_offset=sequence_len_offset,
+                            )
+                            pending_mlp_input = (pre_mlp_layernorm_output, residual)
+                        elif isinstance(layer, FFNSubLayer):
+                            assert pending_mlp_input is not None, \
+                                "FFNSubLayer requires pending_mlp_input from preceding AttentionSubLayer"
+                            hidden_states = layer(*pending_mlp_input)
+                            pending_mlp_input = None
+                            context = None
+                        else:
+                            hidden_states, context = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                context=context,
+                                context_mask=context_mask,
+                                rotary_pos_emb=rotary_pos_emb,
+                                rotary_pos_cos=rotary_pos_cos,
+                                rotary_pos_sin=rotary_pos_sin,
+                                attention_bias=attention_bias,
+                                inference_context=inference_context,
+                                packed_seq_params=packed_seq_params,
+                                sequence_len_offset=sequence_len_offset,
+                            )
+                        # ═══ END half-layer dispatch ═══
 
                     if (
                         torch.is_grad_enabled()
@@ -546,6 +599,12 @@ class TransformerBlock(MegatronModule):
                         and self.group_prefetch_offload_commit_async is not None
                     ):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+
+        # ═══ Half-layer PP: if block ends with AttentionSubLayer, return the 2-tuple ═══
+        if pending_mlp_input is not None:
+            # Block ended with an attention half → output is (pre_mlp_norm, residual)
+            # final_layernorm cannot exist here (validated at config level)
+            return pending_mlp_input
 
         # Final layer norm.
         if self.final_layernorm is not None:

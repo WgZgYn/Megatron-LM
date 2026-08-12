@@ -29,7 +29,14 @@ def get_transformer_layer_offset(config: TransformerConfig):
         if pp_decoder_start is not None:
             pipeline_rank = pipeline_rank - pp_decoder_start
 
-    if config.pipeline_model_parallel_size > 1:
+    if config.split_all_layers and config.decoder_num_half_layers_per_pipeline_stage is not None:
+        from megatron.core.pipeline_parallel.pipeline_partition import get_pipeline_stage_partition
+
+        offset = get_pipeline_stage_partition(config, pipeline_rank).first_full_layer_offset
+    elif config.decoder_num_layers_per_pipeline_stage is not None:
+        # Explicit per-stage layer distribution.
+        offset = sum(config.decoder_num_layers_per_pipeline_stage[:pipeline_rank])
+    elif config.pipeline_model_parallel_size > 1:
 
         if (
             config.num_layers_in_first_pipeline_stage is not None
@@ -234,6 +241,125 @@ class BaseTransformerLayer(ABC):
         pass
 
 
+# ═══ Half-layer PP: extracted shared functions ═══
+# These are the bodies of TransformerLayer._forward_attention / _forward_mlp,
+# extracted as module-level functions so AttentionSubLayer and FFNSubLayer can
+# reuse them without subclassing TransformerLayer.  `module` is any object with
+# the required attributes (input_layernorm, self_attention, mlp, etc.).
+
+def _run_attention(
+    module,
+    hidden_states,
+    attention_mask=None,
+    context=None,
+    context_mask=None,
+    rotary_pos_emb=None,
+    rotary_pos_cos=None,
+    rotary_pos_sin=None,
+    attention_bias=None,
+    inference_context=None,
+    packed_seq_params=None,
+    sequence_len_offset=None,
+):
+    # Residual connection.
+    residual = hidden_states
+
+    # Optional Input Layer norm
+    if getattr(module, 'recompute_input_layernorm', False):
+        module.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+        input_layernorm_output = module.input_layernorm_checkpoint.checkpoint(
+            module.input_layernorm, hidden_states
+        )
+    else:
+        input_layernorm_output = module.input_layernorm(hidden_states)
+
+    # Self attention.
+    attention_output_with_bias = module.self_attention(
+        input_layernorm_output,
+        attention_mask=attention_mask,
+        inference_context=inference_context,
+        rotary_pos_emb=rotary_pos_emb,
+        rotary_pos_cos=rotary_pos_cos,
+        rotary_pos_sin=rotary_pos_sin,
+        attention_bias=attention_bias,
+        packed_seq_params=packed_seq_params,
+        sequence_len_offset=sequence_len_offset,
+    )
+
+    if getattr(module, 'recompute_input_layernorm', False):
+        module.input_layernorm_checkpoint.discard_output_and_register_recompute(
+            attention_output_with_bias[0]
+        )
+
+    with module.bias_dropout_add_exec_handler():
+        hidden_states = module.self_attn_bda(module.training, module.config.bias_dropout_fusion)(
+            attention_output_with_bias, residual, module.hidden_dropout
+        )
+
+    # Residual connection.
+    residual = hidden_states
+
+    # Optional Layer norm after self-attention
+    pre_cross_attn_layernorm_output = module.pre_cross_attn_layernorm(hidden_states)
+
+    # Cross attention.
+    attention_output_with_bias = module.cross_attention(
+        pre_cross_attn_layernorm_output,
+        attention_mask=context_mask,
+        key_value_states=context,
+        inference_context=inference_context,
+    )
+
+    if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
+        context = attention_output_with_bias["context"]
+
+    with module.bias_dropout_add_exec_handler():
+        hidden_states = module.cross_attn_bda(module.training, module.config.bias_dropout_fusion)(
+            attention_output_with_bias, residual, module.hidden_dropout
+        )
+
+    # Residual connection.
+    residual = hidden_states
+
+    # Optional Layer norm post the cross-attention.
+    if getattr(module, 'recompute_pre_mlp_layernorm', False):
+        module.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+        pre_mlp_layernorm_output = module.pre_mlp_norm_checkpoint.checkpoint(
+            module.pre_mlp_layernorm, hidden_states
+        )
+    else:
+        pre_mlp_layernorm_output = module.pre_mlp_layernorm(hidden_states)
+
+    return pre_mlp_layernorm_output, residual, context
+
+
+def _run_mlp(module, pre_mlp_layernorm_output, residual):
+    # MLP.
+    if getattr(module, 'recompute_mlp', False):
+        mlp_output_with_bias = tensor_parallel.checkpoint(
+            module.mlp, False, pre_mlp_layernorm_output
+        )
+    else:
+        mlp_output_with_bias = module.mlp(pre_mlp_layernorm_output)
+
+    if getattr(module, 'recompute_pre_mlp_layernorm', False):
+        module.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
+            mlp_output_with_bias[0]
+        )
+
+    with module.bias_dropout_add_exec_handler():
+        hidden_states = module.mlp_bda(module.training, module.config.bias_dropout_fusion)(
+            mlp_output_with_bias, residual, module.hidden_dropout
+        )
+
+    output = make_viewless_tensor(
+        inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+    )
+
+    return output
+# ═══ END half-layer extracted functions ═══
+
+
 class TransformerLayer(MegatronModule, BaseTransformerLayer):
     """A single transformer layer.
 
@@ -247,6 +373,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         submodules: TransformerLayerSubmodules,
         layer_number: int = 1,
         hidden_dropout: Optional[float] = None,
+        global_layer_number: Optional[int] = None,
     ):
         super().__init__(config=config)
 
@@ -278,7 +405,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 self.current_microbatch = -1
 
         self.submodules_config = submodules
-        self.layer_number = layer_number + get_transformer_layer_offset(self.config)
+        self.layer_number = (
+            global_layer_number
+            if global_layer_number is not None
+            else layer_number + get_transformer_layer_offset(self.config)
+        )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
@@ -432,83 +563,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        # Residual connection.
-        residual = hidden_states
-
-        # Optional Input Layer norm
-        if self.recompute_input_layernorm:
-            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                self.input_layernorm, hidden_states
-            )
-        else:
-            input_layernorm_output = self.input_layernorm(hidden_states)
-
-        # Self attention.
-        attention_output_with_bias = self.self_attention(
-            input_layernorm_output,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
+        return _run_attention(
+            self, hidden_states,
+            attention_mask=attention_mask, context=context, context_mask=context_mask,
+            rotary_pos_emb=rotary_pos_emb, rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin, attention_bias=attention_bias,
+            inference_context=inference_context, packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )
-
-        if self.recompute_input_layernorm:
-            # discard the output of the input layernorm and register the recompute
-            # as a gradient hook of attention_output_with_bias[0]
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
-            )
-
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
-            )
-
-        # Residual connection.
-        residual = hidden_states
-
-        # Optional Layer norm after self-attention
-        pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
-
-        # Cross attention.
-        attention_output_with_bias = self.cross_attention(
-            pre_cross_attn_layernorm_output,
-            attention_mask=context_mask,
-            key_value_states=context,
-            inference_context=inference_context,
-        )
-
-        if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
-            context = attention_output_with_bias["context"]
-
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
-            )
-
-        # Residual connection.
-        residual = hidden_states
-
-        # Optional Layer norm post the cross-attention.
-        if self.recompute_pre_mlp_layernorm:
-            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                self.pre_mlp_layernorm, hidden_states
-            )
-        else:
-            pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
-
-        return pre_mlp_layernorm_output, residual, context
 
     def _forward_mlp(self, pre_mlp_layernorm_output, residual):
         """
@@ -522,39 +584,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
 
-        # MLP.
-        if self.recompute_mlp:
-            mlp_output_with_bias = tensor_parallel.checkpoint(
-                self.mlp, False, pre_mlp_layernorm_output
-            )
-        else:
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
-
-        if self.recompute_pre_mlp_layernorm:
-            # discard the output of the pre-mlp layernorm and register the recompute
-            # as a gradient hook of mlp_output_with_bias[0]
-            self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
-                mlp_output_with_bias[0]
-            )
-
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                mlp_output_with_bias, residual, self.hidden_dropout
-            )
-
-        # Jit compiled function creates 'view' tensor. This tensor
-        # potentially gets saved in the MPU checkpoint function context,
-        # which rejects view tensors. While making a viewless tensor here
-        # won't result in memory savings (like the data loader, or
-        # p2p_communication), it serves to document the origin of this
-        # 'view' tensor.
-        output = make_viewless_tensor(
-            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
-        )
-
-        return output
+        return _run_mlp(self, pre_mlp_layernorm_output, residual)
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None

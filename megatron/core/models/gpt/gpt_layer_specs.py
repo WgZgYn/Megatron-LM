@@ -3,7 +3,9 @@
 import warnings
 from typing import Optional, Union
 
+from megatron.core import parallel_state
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.pipeline_parallel.pipeline_partition import get_pipeline_stage_partition
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -28,6 +30,10 @@ from megatron.core.transformer.transformer_block import (
     get_num_layers_to_build,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_sublayer import (
+    AttentionSubLayer,
+    FFNSubLayer,
+)
 from megatron.core.transformer.transformer_layer import (
     TransformerLayer,
     TransformerLayerSubmodules,
@@ -413,9 +419,65 @@ def get_gpt_decoder_block_spec(
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
-    offset = get_transformer_layer_offset(config)
-    num_layers_to_build = get_num_layers_to_build(config)
-    layer_specs = layer_specs[offset : offset + num_layers_to_build]
+    if config.split_all_layers:
+        # ═══ Half-layer PP (all layers): produce [Attn, FFN] pair per layer ═══
+        # Construction and P2P consume the same plan. A stage may start with
+        # FFN or end with attention, so full-layer slicing is insufficient.
+        pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
+        partition = get_pipeline_stage_partition(config, pipeline_rank)
+        assert partition is not None
+        stage_specs = []
+        for half_layer_index in range(partition.half_start, partition.half_end):
+            full_layer_index = half_layer_index // 2
+            full_spec = layer_specs[full_layer_index]
+            stage_specs.append(
+                ModuleSpec(
+                    module=(AttentionSubLayer if half_layer_index % 2 == 0 else FFNSubLayer),
+                    params={"global_layer_number": full_layer_index + 1},
+                    submodules=full_spec.submodules,
+                )
+            )
+        layer_specs = stage_specs
+        # ═══ END split-all-layers spec construction ═══
+    elif config.pipeline_split_layers is not None:
+        offset = get_transformer_layer_offset(config)
+        num_layers_to_build = get_num_layers_to_build(config)
+        # ═══ Half-layer PP (selective): per-stage specs with split layers ═══
+        start_layer = offset + 1   # 1-based first layer index of this stage
+        end_layer = offset + num_layers_to_build  # 1-based last layer index
+
+        stage_specs = []
+        # Left boundary: if THIS stage's FIRST layer is the FFN half of a split
+        previous_layer = start_layer - 1
+        if previous_layer in config.pipeline_split_layers:
+            full_spec = layer_specs[previous_layer - 1]  # 0-indexed
+            ffn_spec = ModuleSpec(
+                module=FFNSubLayer,
+                params={"global_layer_number": previous_layer},
+                submodules=full_spec.submodules,
+            )
+            stage_specs.append(ffn_spec)
+
+        # Full layers in the middle
+        for g in range(start_layer, end_layer + 1):
+            is_split_right = g in config.pipeline_split_layers
+            if is_split_right:
+                full_spec = layer_specs[g - 1]
+                attn_spec = ModuleSpec(
+                    module=AttentionSubLayer,
+                    params={"global_layer_number": g},
+                    submodules=full_spec.submodules,
+                )
+                stage_specs.append(attn_spec)
+            else:
+                stage_specs.append(layer_specs[g - 1])
+
+        layer_specs = stage_specs
+        # ═══ END selective-split spec construction ═══
+    else:
+        offset = get_transformer_layer_offset(config)
+        num_layers_to_build = get_num_layers_to_build(config)
+        layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Block spec.
     block_spec = TransformerBlockSubmodules(layer_specs=layer_specs, layer_norm=layer_norm_impl)

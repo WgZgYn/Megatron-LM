@@ -430,6 +430,12 @@ def validate_args(args, defaults={}):
         '--num-layers-per-virtual-pipeline-stage and --num-virtual-stages-per-pipeline-rank cannot be set at the same time'
 
     if args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None:
+        assert args.decoder_num_layers_per_pipeline_stage is None, \
+            '--decoder-num-layers-per-pipeline-stage does not support interleaved ' \
+            '(virtual) pipeline parallelism'
+        assert args.decoder_num_half_layers_per_pipeline_stage is None, \
+            '--decoder-num-half-layers-per-pipeline-stage does not support interleaved ' \
+            '(virtual) pipeline parallelism'
         if args.overlap_p2p_comm:
             assert args.pipeline_model_parallel_size > 1, \
                 'When interleaved schedule is used, pipeline-model-parallel size '\
@@ -475,6 +481,11 @@ def validate_args(args, defaults={}):
                   'since non-interleaved schedule does not support overlapping p2p communication '
                   'and aligned param AG')
 
+        assert args.decoder_num_layers_per_pipeline_stage is None or \
+            (args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None), \
+            '--decoder-num-layers-per-pipeline-stage cannot be set at the same time with ' \
+            '--decoder-first-pipeline-num-layers or --decoder-last-pipeline-num-layers'
+
         if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
             # Divisibility check not applicable for T5 models which specify encoder_num_layers
             # and decoder_num_layers.
@@ -487,8 +498,30 @@ def validate_args(args, defaults={}):
                 if args.account_for_loss_in_pipeline_split:
                     num_layers += 1
 
-                assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-                    'Number of layers should be divisible by the pipeline-model-parallel size'
+                if args.decoder_num_layers_per_pipeline_stage is not None:
+                    assert len(args.decoder_num_layers_per_pipeline_stage) == args.transformer_pipeline_model_parallel_size, \
+                        '--decoder-num-layers-per-pipeline-stage must have one entry per pipeline stage'
+                    assert num_layers == sum(args.decoder_num_layers_per_pipeline_stage), \
+                        f'sum of --decoder-num-layers-per-pipeline-stage {args.decoder_num_layers_per_pipeline_stage} must equal {num_layers}'
+                    assert all(x > 0 for x in args.decoder_num_layers_per_pipeline_stage), \
+                        'all entries of --decoder-num-layers-per-pipeline-stage must be larger than 0'
+                elif args.decoder_num_half_layers_per_pipeline_stage is None:
+                    assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+                        'Number of layers should be divisible by the pipeline-model-parallel size'
+
+                if args.decoder_num_half_layers_per_pipeline_stage is not None:
+                    assert args.split_all_layers, \
+                        '--decoder-num-half-layers-per-pipeline-stage requires --split-all-layers'
+                    assert args.decoder_num_layers_per_pipeline_stage is None, \
+                        '--decoder-num-half-layers-per-pipeline-stage is mutually exclusive with --decoder-num-layers-per-pipeline-stage'
+                    assert len(args.decoder_num_half_layers_per_pipeline_stage) == args.transformer_pipeline_model_parallel_size, \
+                        '--decoder-num-half-layers-per-pipeline-stage must have one entry per pipeline stage'
+                    assert sum(args.decoder_num_half_layers_per_pipeline_stage) == num_layers * 2, \
+                        '--decoder-num-half-layers-per-pipeline-stage must sum to num_layers * 2'
+                    assert all(x > 0 for x in args.decoder_num_half_layers_per_pipeline_stage), \
+                        'all entries of --decoder-num-half-layers-per-pipeline-stage must be larger than 0'
+                    
+                
     if args.rank == 0:
         print(f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}")
 
@@ -1018,6 +1051,10 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
+    kw_args['decoder_num_layers_per_pipeline_stage'] = args.decoder_num_layers_per_pipeline_stage
+    kw_args['decoder_num_half_layers_per_pipeline_stage'] = args.decoder_num_half_layers_per_pipeline_stage
+    kw_args['pipeline_split_layers'] = args.pipeline_split_layers
+    kw_args['split_all_layers'] = args.split_all_layers
     kw_args['fp8_param'] = args.fp8_param_gather
     if args.swiglu:
         kw_args['activation_func'] = F.silu
@@ -2054,6 +2091,36 @@ def _add_distributed_args(parser):
                        type=int, default=None,
                        help=('The number of transformer layers on the last pipeline stage of the decoder. '
                        'Default None is even split of transformer layers across all pipeline stages'))
+    
+    
+    group.add_argument('--decoder-num-layers-per-pipeline-stage',
+                       type=int, default=None, nargs='+', metavar='N',
+                       help=('The number of transformer layers on each pipeline stage of the decoder. '
+                       'Must have one entry per pipeline stage and sum to the total number of layers. '
+                       'Default None is even split of transformer layers across all pipeline stages.'))
+
+    group.add_argument('--decoder-num-half-layers-per-pipeline-stage',
+                       type=int, default=None, nargs='+', metavar='N',
+                       help=('Number of attention/FFN half-layers on each decoder pipeline stage. '
+                       'Requires --split-all-layers, must sum to num_layers*2, and is mutually '
+                       'exclusive with --decoder-num-layers-per-pipeline-stage.'))
+
+    group.add_argument('--pipeline-split-layers',
+                       type=int, default=None, nargs='+', metavar='N',
+                       help=('Global (1-based) transformer layer indices to split at the '
+                       'attention/FFN boundary across adjacent pipeline stages. '
+                       'Each index must be a stage boundary (cumulative sum of '
+                       '--decoder-num-layers-per-pipeline-stage). Requires '
+                       '--decoder-num-layers-per-pipeline-stage.'))
+
+    group.add_argument('--split-all-layers', action='store_true',
+                       default=None,
+                       help=('Split EVERY transformer layer at the attention/FFN boundary. '
+                       'Each pipeline stage builds pairs of AttentionSubLayer + FFNSubLayer '
+                       'instead of full TransformerLayers. No cross-stage split occurs. '
+                       'Mutually exclusive with --pipeline-split-layers and VPP.'))
+
+
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
