@@ -919,6 +919,8 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError('split_all_layers does not support VPP')
             if self.recompute_granularity == 'full':
                 raise ValueError('split_all_layers does not support recompute_granularity=full')
+            if self.variable_seq_lengths:
+                raise ValueError('split_all_layers does not support variable sequence lengths')
             if self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split:
                 raise ValueError(
                     'split_all_layers does not support standalone embedding or loss stages'

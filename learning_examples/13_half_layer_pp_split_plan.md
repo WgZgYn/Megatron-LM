@@ -1,4 +1,8 @@
-# 半层切分（Half-Layer PP Split）实现方案
+# 半层切分（Half-Layer PP Split）旧原型方案
+
+> This document records the original multi-tensor prototype and is retained for
+> historical context. The active single-tensor logical-layer design is defined
+> in `14_pipeline_partition_runtime_design.md`.
 
 ## Context
 

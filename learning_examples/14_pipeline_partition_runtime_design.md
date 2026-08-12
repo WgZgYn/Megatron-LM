@@ -15,16 +15,16 @@ experiment notes may describe intermediate prototypes.
 4. `get_gpt_decoder_block_spec()` maps each interval element to an
    `AttentionSubLayer` or `FFNSubLayer` `ModuleSpec` while retaining the original
    1-based global Transformer layer number.
-5. `TransformerBlock` instantiates these specs and dispatches full layers and
-   sublayers. An attention-ending stage returns two tensors: normalized
-   attention output and residual. An FFN-starting stage consumes both.
+5. `TransformerBlock` treats full layers and half-layer fragments uniformly as
+   logical layers with a `Tensor -> (Tensor, context)` contract. Attention packs
+   its normalized output and residual into one `[2, S, B, H]` tensor; FFN
+   unpacks it.
 6. `get_tensor_shapes()` reads the same partition plan. A stage whose interval
-   ends on attention advertises two P2P tensors; every other decoder boundary
-   advertises one. Sender and receiver therefore cannot independently disagree
-   about NCCL operation count.
-7. `backward_step()` preserves output/gradient positions and backpropagates all
-   differentiable outputs. `deallocate_output_tensor()` and `custom_backward()`
-   support one or multiple outputs.
+   ends on attention advertises one `[2, S, B, H]` P2P tensor; every other
+   decoder boundary advertises one `[S, B, H]` tensor. The schedule always
+   executes exactly one P2P operation per GPT stage boundary.
+7. `backward_step()`, pseudo-deallocation, and custom autograd remain on the
+   original Megatron single-output path.
 
 ## Configuration semantics
 
@@ -42,7 +42,7 @@ Example for four layers and PP=2:
 ```text
 half-layer indices: 0:A1 1:F1 2:A2 | 3:F2 4:A3 5:F3 6:A4 7:F4
 distribution:       [3, 5]
-stage 0 sends:      (pre_mlp_layernorm_output, residual)
+stage 0 sends:      stack(pre_mlp_layernorm_output, residual) -> [2,S,B,H]
 stage 1 starts:     FFNSubLayer(global_layer_number=2)
 ```
 
@@ -51,8 +51,8 @@ stage 1 starts:     FFNSubLayer(global_layer_number=2)
 - Half-layer intervals cover exactly `[0, num_layers * 2)` with no gaps or
   overlaps.
 - Model construction and P2P shape planning consume the same interval object.
-- A boundary after attention has exactly two sends, two receives, two backward
-  gradients, and two pseudo-deallocations.
+- Every GPT stage boundary has exactly one forward send/receive and one backward
+  send/receive. Boundary state is encoded inside the tensor shape.
 - Global layer numbering is stable across full and split representations. This
   is required for initialization, MoE routing metadata, logging, and checkpoint
   prefixes.

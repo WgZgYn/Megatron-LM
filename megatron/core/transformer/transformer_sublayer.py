@@ -2,13 +2,13 @@
 
 """Half-layer modules for fine-grained pipeline parallelism.
 
-AttentionSubLayer runs the attention half of a TransformerLayer (through
-pre_mlp_layernorm) and returns (pre_mlp_layernorm_output, residual).
-FFNSubLayer consumes those two tensors and runs the MLP half.
+AttentionSubLayer and FFNSubLayer are logical layers with the same external
+contract as TransformerLayer. Their intermediate state is one packed tensor,
+so pipeline scheduling never handles multiple GPT boundary tensors.
 
 When a layer is split across PP stages:
-  Stage r:   ... TransformerLayer(n) → AttentionSubLayer(n+1)
-  Stage r+1: FFNSubLayer(n+1) → TransformerLayer(n+2) ...
+  Stage r:   ... TransformerLayer(n) -> AttentionSubLayer(n+1)
+  Stage r+1: FFNSubLayer(n+1) -> TransformerLayer(n+2) ...
 """
 
 from typing import Optional
@@ -29,8 +29,7 @@ from megatron.core.transformer.transformer_layer import (
 class AttentionSubLayer(MegatronModule, BaseTransformerLayer):
     """Attention half of a TransformerLayer (input_layernorm through pre_mlp_layernorm).
 
-    Forward returns (pre_mlp_layernorm_output, residual, context) so that the
-    two boundary tensors can be sent to the next PP stage.
+    Forward returns one packed boundary tensor and context.
     """
 
     def __init__(
@@ -107,10 +106,10 @@ class AttentionSubLayer(MegatronModule, BaseTransformerLayer):
         attention_bias=None, inference_context=None, packed_seq_params=None,
         sequence_len_offset=None, *, inference_params=None,
     ):
-        """Run attention half. Returns (pre_mlp_layernorm_output, residual, context)."""
+        """Run attention and encode the FFN inputs as one boundary tensor."""
         from megatron.core.utils import deprecate_inference_params
         inference_context = deprecate_inference_params(inference_context, inference_params)
-        return _run_attention(
+        pre_mlp_layernorm_output, residual, context = _run_attention(
             self, hidden_states,
             attention_mask=attention_mask, context=context, context_mask=context_mask,
             rotary_pos_emb=rotary_pos_emb, rotary_pos_cos=rotary_pos_cos,
@@ -118,13 +117,13 @@ class AttentionSubLayer(MegatronModule, BaseTransformerLayer):
             inference_context=inference_context, packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )
+        return torch.stack((pre_mlp_layernorm_output, residual), dim=0), context
 
 
 class FFNSubLayer(MegatronModule, BaseTransformerLayer):
-    """FFN half of a TransformerLayer (pre_mlp_layernorm → mlp → mlp_bda).
+    """FFN half of a TransformerLayer (pre_mlp_layernorm -> mlp -> mlp_bda).
 
-    Forward accepts (pre_mlp_layernorm_output, residual) — the two tensors
-    received from the attention half across the PP boundary.
+    Forward decodes the single packed tensor received from the attention half.
     """
 
     def __init__(
@@ -164,6 +163,12 @@ class FFNSubLayer(MegatronModule, BaseTransformerLayer):
         self.recompute_input_layernorm = False  # not owned
         self.recompute_pre_mlp_layernorm = False  # disabled for split layers
 
-    def forward(self, pre_mlp_layernorm_output, residual):
-        """Run MLP half. Returns hidden_states."""
-        return _run_mlp(self, pre_mlp_layernorm_output, residual)
+    def forward(self, hidden_states, context=None, **kwargs):
+        """Decode one boundary tensor and run the MLP half."""
+        if hidden_states.dim() != 4 or hidden_states.size(0) != 2:
+            raise RuntimeError(
+                'FFNSubLayer expects a packed [2, sequence, batch, hidden] tensor, '
+                f'got shape {tuple(hidden_states.shape)}'
+            )
+        pre_mlp_layernorm_output, residual = hidden_states.unbind(dim=0)
+        return _run_mlp(self, pre_mlp_layernorm_output, residual), None

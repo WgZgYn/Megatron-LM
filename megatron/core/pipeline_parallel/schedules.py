@@ -123,10 +123,6 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     '''
     if (out is None) or (not deallocate_pipeline_outputs):
         return
-    if isinstance(out, (list, tuple)):
-        for tensor in out:
-            deallocate_output_tensor(tensor, deallocate_pipeline_outputs=True)
-        return
     assert isinstance(out, torch.Tensor), "expected Tensor, found %s." % type(out).__name__
     assert out._base is None, "counter-productive to free a view of another tensor."
     out.data = torch.empty((1,), device=out.device, dtype=out.dtype)
@@ -141,25 +137,18 @@ def custom_backward(output, grad_output):
     grad have the same shape, while C++'s 'backward' does not.
     '''
 
-    outputs = list(output) if isinstance(output, (list, tuple)) else [output]
-    grad_outputs = list(grad_output) if isinstance(grad_output, (list, tuple)) else [grad_output]
-    assert len(outputs) == len(grad_outputs)
-
-    normalized_grads = []
-    for tensor, grad in zip(outputs, grad_outputs):
-        assert isinstance(tensor, torch.Tensor), "output == '%s'." % type(tensor).__name__
-        assert tensor.numel() == 1, "output should be pseudo-'freed' in schedule"
-        assert isinstance(grad, (torch.Tensor, type(None))), (
-            "grad_output == '%s'." % type(grad).__name__
-        )
-        normalized_grads.append(
-            torch.ones_like(tensor, memory_format=torch.preserve_format) if grad is None else grad
-        )
+    assert output.numel() == 1, "output should be pseudo-'freed' in schedule, to optimize memory"
+    assert isinstance(output, torch.Tensor), "output == '%s'." % type(output).__name__
+    assert isinstance(grad_output, (torch.Tensor, type(None))), (
+        "grad_output == '%s'." % type(grad_output).__name__
+    )
+    if grad_output is None:
+        grad_output = torch.ones_like(output, memory_format=torch.preserve_format)
 
     # Call c++ engine [ see torch/csrc/autograd/python_engine.cpp ]
     Variable._execution_engine.run_backward(
-        tensors=tuple(outputs),
-        grad_tensors=tuple(normalized_grads),
+        tensors=(output,),
+        grad_tensors=(grad_output,),
         keep_graph=False,
         create_graph=False,
         inputs=tuple(),
@@ -353,22 +342,9 @@ def forward_step(
     ):
         return [output_tensor, input_tensor[-1]], num_tokens
 
-    # ═══ Half-layer PP: normalize tuple output to flat list ═══
-    # If a stage ends with AttentionSubLayer, the model returns a tuple
-    # (pre_mlp_layernorm_output, residual) which must become a flat list
-    # of 2 tensors so the PP schedule wrappers process each one correctly.
-    if isinstance(output_tensor, tuple):
-        output_tensor = list(output_tensor)
-
     if unwrap_output_tensor:
-        # Normal stage, single tensor → return as-is (original behavior)
-        if not isinstance(output_tensor, list):
-            return output_tensor, num_tokens
-        # Half-layer PP: multi-tensor list, don't unwrap
         return output_tensor, num_tokens
-    # input was already a list → wrap if not already a list
-    return output_tensor if isinstance(output_tensor, list) else [output_tensor], num_tokens
-    # ═══ END half-layer normalization ═══
+    return [output_tensor], num_tokens
 
 
 def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
@@ -410,25 +386,11 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     # will not participate in the computation.
     # This results in a tensor that does not require gradients.
     # In such cases, we intentionally skip the backward pass while preserving zero gradients.
-    # ═══ Half-layer PP: multi-tensor backward ═══
-    # When a stage starts with FFNSubLayer, output_tensor_grad may be a list
-    # of 2 tensors. Filter to only tensors that require grad.
-    output_grad_pairs = [
-        (tensor, output_tensor_grad[index] if index < len(output_tensor_grad) else None)
-        for index, tensor in enumerate(output_tensor)
-        if tensor is not None and tensor.requires_grad
-    ]
-    grad_outputs = [pair[0] for pair in output_grad_pairs]
-    grad_tensors = [pair[1] for pair in output_grad_pairs]
-    if len(grad_outputs) > 0:
+    if output_tensor[0].requires_grad:
         if config.deallocate_pipeline_outputs:
-            custom_backward(grad_outputs, grad_tensors)
+            custom_backward(output_tensor[0], output_tensor_grad[0])
         else:
-            torch.autograd.backward(
-                grad_outputs,
-                grad_tensors=grad_tensors if any(g is not None for g in grad_tensors) else None,
-            )
-    # ═══ END half-layer backward ═══
+            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -1673,13 +1635,12 @@ def get_tensor_shapes(
             tensor_shapes.append((decoder_seq_length, micro_batch_size, config.hidden_size))
     else:  # model_type == ModelType.encoder_or_decoder
         tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
-        # ═══ Half-layer PP: add second shape at split boundaries ═══
         if config.split_all_layers:
-            # Attention produces (normalized_output, residual). Both ranks derive
-            # this two-tensor boundary from the same canonical partition plan.
+            # A stage ending at attention packs the normalized output and residual
+            # into one tensor, preserving the standard one-tensor P2P contract.
             partition = get_pipeline_stage_partition(config, rank)
             if partition is not None and partition.ends_with_attention:
-                tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
+                tensor_shapes[-1] = (2, seq_length, micro_batch_size, config.hidden_size)
         elif config.pipeline_split_layers is not None:
             if config.decoder_num_layers_per_pipeline_stage is not None:
                 boundary_layer = sum(config.decoder_num_layers_per_pipeline_stage[: rank + 1])
@@ -1688,8 +1649,7 @@ def get_tensor_shapes(
                     config.num_layers // config.pipeline_model_parallel_size
                 )
             if boundary_layer in config.pipeline_split_layers:
-                tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
-        # ═══ END half-layer shape ═══
+                tensor_shapes[-1] = (2, seq_length, micro_batch_size, config.hidden_size)
     return tensor_shapes
 
 
@@ -1740,11 +1700,6 @@ def send_forward_recv_backward(output_tensors, tensor_shapes, config):
     with non-interleaving schedule."""
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
-    if len(output_tensors) > 1:
-        assert len(output_tensors) == len(tensor_shapes)
-        return p2p_communication.send_forward_recv_backward_multi(
-            output_tensors, tensor_shapes, config
-        )
     output_tensor_grads = []
     for output_tensor, tensor_shape in zip(output_tensors, tensor_shapes):
         if tensor_shape is None:
@@ -1762,11 +1717,6 @@ def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config):
     with non-interleaving schedule."""
     if not isinstance(input_tensor_grads, list):
         input_tensor_grads = [input_tensor_grads]
-    if len(input_tensor_grads) > 1:
-        assert len(input_tensor_grads) == len(tensor_shapes)
-        return p2p_communication.send_backward_recv_forward_multi(
-            input_tensor_grads, tensor_shapes, config
-        )
     input_tensors = []
     for input_tensor_grad, tensor_shape in zip(input_tensor_grads, tensor_shapes):
         if tensor_shape is None:
@@ -1962,7 +1912,7 @@ def forward_backward_pipelining_without_interleaving(
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
 
     # ═══ CUSTOM LOG: warmup→1f1b transition ═══
     _warmup_end = _time.time()
@@ -2019,7 +1969,7 @@ def forward_backward_pipelining_without_interleaving(
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
 
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.

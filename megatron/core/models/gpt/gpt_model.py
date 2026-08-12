@@ -229,16 +229,10 @@ class GPTModel(LanguageModule):
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
 
-        # ═══ Half-layer PP: accept 2-tensor input for FFN starting stage ═══
-        assert len(input_tensor) in (1, 2), (
-            f'input_tensor should be length 1 or 2 for gpt, got {len(input_tensor)}'
-        )
-        if len(input_tensor) == 2:
-            # FFN half: pass both (pre_mlp_layernorm_output, residual) to decoder
-            self.decoder.set_input_tensor(input_tensor)
-        else:
-            self.decoder.set_input_tensor(input_tensor[0])
-        # ═══ END half-layer input ═══
+        # Split layers encode their intermediate state in one packed tensor, so
+        # GPT keeps the standard single-input pipeline contract.
+        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
+        self.decoder.set_input_tensor(input_tensor[0])
 
     def forward(
         self,
