@@ -1829,9 +1829,9 @@ def forward_backward_pipelining_without_interleaving(
 
     # ═══ CUSTOM LOG: PP schedule parameters (env: MEGATRON_DEBUG_LOG=1) ═══
     import os as _os3
-    if _os3.environ.get('MEGATRON_DEBUG_LOG', '0') == '1' and not hasattr(forward_backward_pipelining_without_interleaving, "_step_count"):
+    if not hasattr(forward_backward_pipelining_without_interleaving, "_step_count"):
         forward_backward_pipelining_without_interleaving._step_count = 0
-    if forward_backward_pipelining_without_interleaving._step_count == 0:
+    if _os3.environ.get('MEGATRON_DEBUG_LOG', '0') == '1' and forward_backward_pipelining_without_interleaving._step_count == 0:
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         g_rank = torch.distributed.get_rank()
