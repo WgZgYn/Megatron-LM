@@ -12,3 +12,6 @@ local/
 wandb/
 onelogger.log
 onelogger.err
+# local experiments
+learning_examples/
+.idea/
