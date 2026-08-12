@@ -1663,6 +1663,8 @@ def get_tensor_shapes(
         tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
         # ═══ Half-layer PP: add second shape at split boundaries ═══
         if config.pipeline_split_layers is not None:
+            import os as _os_ts
+            _dbg = _os_ts.environ.get('MEGATRON_DEBUG_LOG', '0') == '1'
             if config.decoder_num_layers_per_pipeline_stage is not None:
                 # With split_all_layers, counts half-layers; without, counts full layers.
                 # Either way, cumsum gives the boundary in the same units as pipeline_split_layers.
@@ -1676,6 +1678,14 @@ def get_tensor_shapes(
                 cumsum = (rank + 1) * (config.num_layers // config.pipeline_model_parallel_size)
             if cumsum in config.pipeline_split_layers:
                 tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
+                if _dbg:
+                    g_r = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+                    print(f"[HALF-SHAPE] rank={g_r} query_rank={rank} cumsum={cumsum} "
+                          f"splits={config.pipeline_split_layers} → 2 shapes", flush=True)
+            elif _dbg:
+                g_r = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+                print(f"[HALF-SHAPE] rank={g_r} query_rank={rank} cumsum={cumsum} "
+                      f"splits={config.pipeline_split_layers} → 1 shape (no split at boundary)", flush=True)
         # ═══ END half-layer shape ═══
     return tensor_shapes
 
@@ -1826,6 +1836,16 @@ def forward_backward_pipelining_without_interleaving(
     )
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
+
+    # ═══ Half-layer PP: debug config values on first step ═══
+    import os as _os_cfg
+    if _os_cfg.environ.get('MEGATRON_DEBUG_LOG', '0') == '1':
+        g_r = torch.distributed.get_rank()
+        print(f"[HALF-CFG] RANK={g_r} split_all={config.split_all_layers} "
+              f"pipeline_split_layers={config.pipeline_split_layers} "
+              f"decoder_dist={config.decoder_num_layers_per_pipeline_stage} "
+              f"num_layers={config.num_layers}", flush=True)
+    # ═══ END half-layer config debug ═══
 
     # ═══ CUSTOM LOG: PP schedule parameters (env: MEGATRON_DEBUG_LOG=1) ═══
     import os as _os3
