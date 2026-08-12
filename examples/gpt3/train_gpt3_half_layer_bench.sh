@@ -59,15 +59,15 @@ run_exp 2 "pp2_split_uniform" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
     --split-all-layers
 
-# A3) Uneven (mild): 4+8 full layers per stage → 8+16 half-layers
-run_exp 2 "pp2_split_uneven_4_8" \
+# A3) Uneven (mild): GPU0=8 halves, GPU1=16 halves (=4+8 full layers, no cross)
+run_exp 2 "pp2_split_uneven_8_16" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
-    --split-all-layers --decoder-num-layers-per-pipeline-stage 4 8
+    --split-all-layers --decoder-num-layers-per-pipeline-stage 8 16
 
-# A4) Uneven (extreme): 3+9 full layers → 6+18 half-layers
-run_exp 2 "pp2_split_uneven_3_9" \
+# A4) Uneven (extreme): GPU0=6 halves, GPU1=18 halves (=3+9 full layers, no cross)
+run_exp 2 "pp2_split_uneven_6_18" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
-    --split-all-layers --decoder-num-layers-per-pipeline-stage 3 9
+    --split-all-layers --decoder-num-layers-per-pipeline-stage 6 18
 
 # A5) Half-layer granularity: 11+13 half-layers, auto-split at layer 6
 #     (split_all_layers changes units to half-layers, sum = 12*2 = 24)
@@ -95,25 +95,25 @@ run_exp 4 "pp4_half_layer_5_7_6_6" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 4 \
     --split-all-layers --decoder-num-layers-per-pipeline-stage 5 7 6 6
 
-# B4) Uneven: [1,2,5,4] full layers → [2,4,10,8] half-layers
-#     stage0 light, stage2 heavy
-run_exp 4 "pp4_split_uneven" \
+# B4) Uneven: [2,4,10,8] half-layers (=1+2+5+4 full layers, no cross)
+#     GPU0 light, GPU2 heavy
+run_exp 4 "pp4_split_uneven_2_4_10_8" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 4 \
-    --split-all-layers --decoder-num-layers-per-pipeline-stage 1 2 5 4
+    --split-all-layers --decoder-num-layers-per-pipeline-stage 2 4 10 8
 
 echo ""
 echo "=== SUMMARY ==="
 echo "PP=2 (2 GPUs, DP=1, TP=1) logs:"
 echo "  A1 baseline:     /tmp/pp_bench_pp2_baseline.log"
 echo "  A2 split uniform: /tmp/pp_bench_pp2_split_uniform.log"
-echo "  A3 split 4+8:    /tmp/pp_bench_pp2_split_uneven_4_8.log"
-echo "  A4 split 3+9:    /tmp/pp_bench_pp2_split_uneven_3_9.log"
+echo "  A3 split 8+16:    /tmp/pp_bench_pp2_split_uneven_8_16.log"
+echo "  A4 split 6+18:    /tmp/pp_bench_pp2_split_uneven_6_18.log"
 echo "  A5 half-layer 11+13: /tmp/pp_bench_pp2_half_layer_11_13.log"
 echo "PP=4 (4 GPUs, DP=1, TP=1) logs:"
 echo "  B1 baseline:     /tmp/pp_bench_pp4_baseline.log"
 echo "  B2 split uniform: /tmp/pp_bench_pp4_split_uniform.log"
 echo "  B3 half-layer 5+7+6+6: /tmp/pp_bench_pp4_half_layer_5_7_6_6.log"
-echo "  B4 split uneven:  /tmp/pp_bench_pp4_split_uneven.log"
+echo "  B4 split 2+4+10+8: /tmp/pp_bench_pp4_split_uneven_2_4_10_8.log"
 echo ""
 echo "Key numbers to compare (grep from logs):"
 echo "  'number of parameters'  → per-rank params"
