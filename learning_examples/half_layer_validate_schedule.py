@@ -1,7 +1,7 @@
-"""Exercise the PP=2 [11, 13] split with Megatron's real 1F1B schedule.
+"""Exercise the PP=4 [5, 7, 6, 6] split with Megatron's real 1F1B schedule.
 
 Usage:
-  LOG_P2P_COMMS=1 torchrun --nproc_per_node=2 \
+  LOG_P2P_COMMS=1 torchrun --nproc_per_node=4 \
     learning_examples/half_layer_validate_schedule.py
 """
 
@@ -28,7 +28,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 parallel_state.initialize_model_parallel(
     tensor_model_parallel_size=1,
-    pipeline_model_parallel_size=2,
+    pipeline_model_parallel_size=4,
     context_parallel_size=1,
     expert_model_parallel_size=1,
     order='tp-cp-ep-dp-pp',
@@ -40,11 +40,10 @@ config = TransformerConfig(
     num_layers=12,
     hidden_size=128,
     num_attention_heads=4,
-    pipeline_model_parallel_size=2,
+    pipeline_model_parallel_size=4,
     pipeline_dtype=torch.float32,
     params_dtype=torch.float32,
-    split_all_layers=True,
-    decoder_num_half_layers_per_pipeline_stage=[11, 13],
+    decoder_num_half_layers_per_pipeline_stage=[5, 7, 6, 6],
     deallocate_pipeline_outputs=True,
     recompute_granularity=None,
 )
@@ -53,7 +52,7 @@ block = TransformerBlock(
     config,
     get_gpt_decoder_block_spec(config, use_transformer_engine=False),
     pre_process=(pp_rank == 0),
-    post_process=(pp_rank == 1),
+    post_process=(pp_rank == 3),
 ).cuda()
 
 
@@ -119,7 +118,7 @@ losses = forward_backward_pipelining_without_interleaving(
 assert any(parameter.grad is not None for parameter in model.parameters())
 dist.barrier()
 if dist.get_rank() == 0:
-    print('PP=2 [11,13] 8-microbatch 1F1B validation: PASSED', flush=True)
+    print('PP=4 [5,7,6,6] 8-microbatch 1F1B validation: PASSED', flush=True)
 
 parallel_state.destroy_model_parallel()
 dist.destroy_process_group()

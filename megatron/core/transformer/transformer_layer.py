@@ -29,13 +29,13 @@ def get_transformer_layer_offset(config: TransformerConfig):
         if pp_decoder_start is not None:
             pipeline_rank = pipeline_rank - pp_decoder_start
 
-    if config.split_all_layers and config.decoder_num_half_layers_per_pipeline_stage is not None:
-        from megatron.core.pipeline_parallel.pipeline_partition import get_pipeline_stage_partition
+    if (
+        config.decoder_num_layers_per_pipeline_stage is not None
+        or config.decoder_num_half_layers_per_pipeline_stage is not None
+    ):
+        from megatron.core.pipeline_parallel.pipeline_partition import build_pipeline_plan
 
-        offset = get_pipeline_stage_partition(config, pipeline_rank).first_full_layer_offset
-    elif config.decoder_num_layers_per_pipeline_stage is not None:
-        # Explicit per-stage layer distribution.
-        offset = sum(config.decoder_num_layers_per_pipeline_stage[:pipeline_rank])
+        offset = build_pipeline_plan(config).stage(pipeline_rank).first_full_layer_offset
     elif config.pipeline_model_parallel_size > 1:
 
         if (

@@ -187,40 +187,43 @@ class TransformerBlockSubmodules:
 
     layer_specs: List[ModuleSpec] = None
     layer_norm: Optional[Union[ModuleSpec, torch.nn.Module]] = None
+    layer_specs_are_global: bool = False
 
 
 def get_pipeline_layer_specs(
     config: TransformerConfig, layer_specs: List[ModuleSpec]
 ) -> List[ModuleSpec]:
-    """Select and, when needed, split the full-layer specs for this PP stage."""
+    """Materialize this stage from global full-layer specifications."""
+    # Avoid pipeline_parallel.__init__ importing schedules while schedules is
+    # still importing TransformerBlock.
+    from megatron.core.pipeline_parallel.pipeline_partition import (
+        FragmentKind,
+        build_pipeline_plan,
+    )
+
     if len(layer_specs) != config.num_layers:
         raise ValueError(
             f'expected {config.num_layers} global layer specs, got {len(layer_specs)}'
         )
 
-    if config.split_all_layers:
-        # Local import avoids transformer_block -> pipeline_parallel.__init__ -> schedules
-        # -> multi_token_prediction -> transformer_block during module initialization.
-        from megatron.core.pipeline_parallel.pipeline_partition import (
-            get_pipeline_stage_partition,
-        )
-
-        partition = get_pipeline_stage_partition(
-            config, parallel_state.get_pipeline_model_parallel_rank()
-        )
-        assert partition is not None
+    plan = build_pipeline_plan(config)
+    if plan is not None:
+        stage = plan.stage(parallel_state.get_pipeline_model_parallel_rank())
         stage_specs = []
-        for half_layer_index in range(partition.half_start, partition.half_end):
-            full_layer_index = half_layer_index // 2
-            full_spec = layer_specs[full_layer_index]
+        for fragment in stage.fragments:
+            full_spec = layer_specs[fragment.layer_number - 1]
+            if fragment.kind is FragmentKind.FULL:
+                module = full_spec.module
+            elif fragment.kind is FragmentKind.ATTENTION:
+                module = AttentionSubLayer
+            else:
+                module = FFNSubLayer
             stage_specs.append(
                 ModuleSpec(
-                    module=(
-                        AttentionSubLayer if half_layer_index % 2 == 0 else FFNSubLayer
-                    ),
+                    module=module,
                     params={
-                        **full_spec.params,
-                        'global_layer_number': full_layer_index + 1,
+                        **(full_spec.params or {}),
+                        'global_layer_number': fragment.layer_number,
                     },
                     submodules=full_spec.submodules,
                 )
@@ -229,39 +232,7 @@ def get_pipeline_layer_specs(
 
     offset = get_transformer_layer_offset(config)
     num_layers_to_build = get_num_layers_to_build(config)
-    if config.pipeline_split_layers is None:
-        return layer_specs[offset : offset + num_layers_to_build]
-
-    start_layer = offset + 1
-    end_layer = offset + num_layers_to_build
-    stage_specs = []
-    previous_layer = start_layer - 1
-    if previous_layer in config.pipeline_split_layers:
-        full_spec = layer_specs[previous_layer - 1]
-        stage_specs.append(
-            ModuleSpec(
-                module=FFNSubLayer,
-                params={**full_spec.params, 'global_layer_number': previous_layer},
-                submodules=full_spec.submodules,
-            )
-        )
-
-    for global_layer_number in range(start_layer, end_layer + 1):
-        full_spec = layer_specs[global_layer_number - 1]
-        if global_layer_number in config.pipeline_split_layers:
-            stage_specs.append(
-                ModuleSpec(
-                    module=AttentionSubLayer,
-                    params={
-                        **full_spec.params,
-                        'global_layer_number': global_layer_number,
-                    },
-                    submodules=full_spec.submodules,
-                )
-            )
-        else:
-            stage_specs.append(full_spec)
-    return stage_specs
+    return layer_specs[offset : offset + num_layers_to_build]
 
 
 def _get_block_submodules(
@@ -282,7 +253,12 @@ def _get_block_submodules(
 
     # Transformer block submodules.
     if isinstance(spec, TransformerBlockSubmodules):
-        return spec
+        if not spec.layer_specs_are_global:
+            return spec
+        return TransformerBlockSubmodules(
+            layer_specs=get_pipeline_layer_specs(config, spec.layer_specs),
+            layer_norm=spec.layer_norm,
+        )
 
     # ModuleSpec here is generally assumed to be for a transformer layer that
     # is implemented in `transformer_layer.py` or if it subclasses

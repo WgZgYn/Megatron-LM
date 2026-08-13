@@ -49,7 +49,7 @@ class TransformerConfig(ModelParallelConfig):
 
     decoder_num_half_layers_per_pipeline_stage: Optional[List[int]] = None
     """Number of attention/FFN half-layers on each pipeline stage.
-    Requires ``split_all_layers`` and sums to ``num_layers * 2``."""
+    Must sum to ``num_layers * 2``. Odd cumulative boundaries split a layer."""
 
     pipeline_split_layers: Optional[List[int]] = None
     """Global (1-based) transformer layer indices split at the attention/FFN boundary
@@ -58,11 +58,11 @@ class TransformerConfig(ModelParallelConfig):
     Requires ``decoder_num_layers_per_pipeline_stage``."""
 
     split_all_layers: bool = False
-    """If True, EVERY transformer layer is split at the attention/FFN boundary
-    into AttentionSubLayer + FFNSubLayer half-layer pairs. Full-layer and
-    half-layer distributions are configured by separate fields. A half-layer
-    stage boundary can cut a full layer and requires two-tensor P2P transfer.
-    Mutually exclusive with VPP and explicit ``pipeline_split_layers``."""
+    """Deprecated compatibility flag.
+
+    The planner now preserves co-located full layers. Use
+    ``decoder_num_half_layers_per_pipeline_stage`` for half-layer boundaries.
+    """
 
     account_for_embedding_in_pipeline_split: bool = False
     """If set, the embedding layer will be treated as a standard transformer
@@ -907,29 +907,36 @@ class TransformerConfig(ModelParallelConfig):
                     'all elements of decoder_num_layers_per_pipeline_stage must be larger than 0'
                 )
 
-        # ═══ Half-layer PP: validate split modes ═══
-        # ═══ Half-layer PP: validate split_all_layers ═══
-        if self.split_all_layers:
-            if self.pipeline_split_layers is not None:
-                raise ValueError(
-                    'split_all_layers and pipeline_split_layers are mutually exclusive; '
-                    'use decoder_num_half_layers_per_pipeline_stage for cross-stage half splits'
-                )
+        has_half_layer_boundaries = False
+        if self.decoder_num_half_layers_per_pipeline_stage is not None:
+            cumulative = 0
+            for count in self.decoder_num_half_layers_per_pipeline_stage[:-1]:
+                cumulative += count
+                has_half_layer_boundaries = has_half_layer_boundaries or cumulative % 2 == 1
+        elif self.pipeline_split_layers is not None:
+            has_half_layer_boundaries = True
+
+        if has_half_layer_boundaries:
             if self.virtual_pipeline_model_parallel_size is not None:
-                raise ValueError('split_all_layers does not support VPP')
+                raise ValueError('half-layer pipeline boundaries do not support VPP yet')
             if self.recompute_granularity == 'full':
-                raise ValueError('split_all_layers does not support recompute_granularity=full')
+                raise ValueError('half-layer pipeline boundaries do not support full recompute')
             if self.variable_seq_lengths:
-                raise ValueError('split_all_layers does not support variable sequence lengths')
+                raise ValueError('half-layer pipeline boundaries do not support variable sequence lengths')
             if self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split:
                 raise ValueError(
-                    'split_all_layers does not support standalone embedding or loss stages'
+                    'half-layer pipeline boundaries do not support standalone embedding or loss stages'
                 )
 
         if self.decoder_num_half_layers_per_pipeline_stage is not None:
-            if not self.split_all_layers:
+            if self.virtual_pipeline_model_parallel_size is not None:
                 raise ValueError(
-                    'decoder_num_half_layers_per_pipeline_stage requires split_all_layers'
+                    'decoder_num_half_layers_per_pipeline_stage does not support VPP yet'
+                )
+            if self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split:
+                raise ValueError(
+                    'decoder_num_half_layers_per_pipeline_stage does not support standalone '
+                    'embedding or loss stages'
                 )
             if self.decoder_num_layers_per_pipeline_stage is not None:
                 raise ValueError(
@@ -979,8 +986,6 @@ class TransformerConfig(ModelParallelConfig):
                     )
             if len(self.pipeline_split_layers) != len(set(self.pipeline_split_layers)):
                 raise ValueError('pipeline_split_layers contains duplicate indices')
-        # ═══ END half-layer validation ═══
-
         if self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split:
             if self.virtual_pipeline_model_parallel_size is None:
                 num_layers = self.num_layers

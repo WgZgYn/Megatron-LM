@@ -19,12 +19,10 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
-    get_num_layers_to_build,
 )
 from megatron.core.transformer.transformer_layer import (
     TransformerLayer,
     TransformerLayerSubmodules,
-    get_transformer_layer_offset,
 )
 from megatron.core.utils import is_te_min_version
 
@@ -195,15 +193,13 @@ def get_gpt_heterogeneous_layer_spec(config: HeterogeneousTransformerConfig, use
         for block_params in config.per_block_parameters
     ]
 
-    # Slice the layer specs to only include the layers that are built in this pipeline stage.
-    # Note: MCore layer_number starts at 1
-    offset = get_transformer_layer_offset(config)
-    num_layers_to_build = get_num_layers_to_build(config)
-    layer_specs = layer_specs[offset : offset + num_layers_to_build]
-
     # Submodules layer_norm determines the type of layernorm used in the last layernorm
     if use_te:
         layer_norm = TENorm
     else:
         layer_norm = LNImpl if config.normalization == "LayerNorm" else WrappedTorchNorm
-    return TransformerBlockSubmodules(layer_specs, layer_norm=layer_norm)
+    return TransformerBlockSubmodules(
+        layer_specs,
+        layer_norm=layer_norm,
+        layer_specs_are_global=True,
+    )

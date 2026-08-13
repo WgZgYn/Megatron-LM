@@ -13,6 +13,9 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
 )
 from megatron.core.pipeline_parallel.pipeline_partition import (
+    BoundaryKind,
+    FragmentKind,
+    build_pipeline_plan,
     build_pipeline_stage_partitions,
     get_cross_stage_split_layers,
 )
@@ -26,6 +29,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_sublayer import AttentionSubLayer, FFNSubLayer
 from megatron.core.transformer.transformer_block import TransformerBlock, _get_block_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
 def _make_config(**overrides):
@@ -49,6 +53,11 @@ def test_split_all_full_layer_distribution_is_converted_to_halves():
     )
     assert [part.num_half_layers for part in build_pipeline_stage_partitions(config)] == [4, 4]
     assert get_cross_stage_split_layers(config) == []
+    assert all(
+        fragment.kind is FragmentKind.FULL
+        for stage in build_pipeline_plan(config).stages
+        for fragment in stage.fragments
+    )
 
 
 def test_half_layer_distribution_crosses_full_layer():
@@ -80,20 +89,11 @@ def test_real_gpt_spec_starts_second_stage_with_ffn(monkeypatch):
     )
     monkeypatch.setattr(parallel_state, "get_pipeline_model_parallel_rank", lambda: 1)
     block_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=False)
-    assert [spec.module for spec in block_spec.layer_specs] == [
-        FFNSubLayer,
-        AttentionSubLayer,
-        FFNSubLayer,
-        AttentionSubLayer,
-        FFNSubLayer,
+    block_submodules = _get_block_submodules(config, block_spec)
+    assert [spec.module for spec in block_submodules.layer_specs] == [
+        FFNSubLayer, TransformerLayer, TransformerLayer
     ]
-    assert [spec.params["global_layer_number"] for spec in block_spec.layer_specs] == [
-        2,
-        3,
-        3,
-        4,
-        4,
-    ]
+    assert [spec.params["global_layer_number"] for spec in block_submodules.layer_specs] == [2, 3, 4]
 
 
 def test_pretrain_dense_layer_spec_uses_half_layer_partition(monkeypatch):
@@ -111,7 +111,7 @@ def test_pretrain_dense_layer_spec_uses_half_layer_partition(monkeypatch):
     assert block_submodules.layer_specs[-1].params['global_layer_number'] == 6
 
 
-def test_transformer_block_builds_uniform_logical_layer_sequence(monkeypatch):
+def test_uniform_half_coordinates_preserve_full_layers(monkeypatch):
     config = _make_config(
         num_layers=2,
         pipeline_model_parallel_size=1,
@@ -135,12 +135,7 @@ def test_transformer_block_builds_uniform_logical_layer_sequence(monkeypatch):
     try:
         block_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=False)
         block = TransformerBlock(config, block_spec, post_layer_norm=False)
-        assert [type(layer) for layer in block.layers] == [
-            AttentionSubLayer,
-            FFNSubLayer,
-            AttentionSubLayer,
-            FFNSubLayer,
-        ]
+        assert [type(layer) for layer in block.layers] == [TransformerLayer, TransformerLayer]
         if torch.cuda.is_available():
             block = block.cuda()
             hidden_states = torch.randn(
@@ -183,11 +178,12 @@ def test_pp2_11_13_contract(monkeypatch):
     monkeypatch.setattr(parallel_state, 'get_pipeline_model_parallel_rank', lambda: 1)
 
     block_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=False)
-    assert len(block_spec.layer_specs) == 13
-    assert block_spec.layer_specs[0].module is FFNSubLayer
-    assert block_spec.layer_specs[0].params['global_layer_number'] == 6
-    assert block_spec.layer_specs[-1].module is FFNSubLayer
-    assert block_spec.layer_specs[-1].params['global_layer_number'] == 12
+    block_submodules = _get_block_submodules(config, block_spec)
+    assert len(block_submodules.layer_specs) == 7
+    assert block_submodules.layer_specs[0].module is FFNSubLayer
+    assert block_submodules.layer_specs[0].params['global_layer_number'] == 6
+    assert block_submodules.layer_specs[-1].module is TransformerLayer
+    assert block_submodules.layer_specs[-1].params['global_layer_number'] == 12
 
     shape_args = dict(
         model_type=ModelType.encoder_or_decoder,
@@ -250,7 +246,10 @@ def test_1f1b_boundary_uses_one_standard_p2p_call(monkeypatch):
     "overrides, message",
     [
         (
-            dict(split_all_layers=True, virtual_pipeline_model_parallel_size=2),
+            dict(
+                decoder_num_half_layers_per_pipeline_stage=[3, 5],
+                virtual_pipeline_model_parallel_size=2,
+            ),
             "VPP",
         ),
         (
@@ -284,6 +283,34 @@ def test_selective_split_must_be_full_layer_stage_boundary():
             decoder_num_layers_per_pipeline_stage=[3, 3, 3, 3],
             pipeline_split_layers=[4],
         )
+
+
+def test_pp4_half_plan_only_splits_the_cross_stage_layer():
+    config = _make_config(
+        num_layers=12,
+        pipeline_model_parallel_size=4,
+        decoder_num_half_layers_per_pipeline_stage=[5, 7, 6, 6],
+    )
+    plan = build_pipeline_plan(config)
+
+    assert [fragment.kind for fragment in plan.stage(0).fragments] == [
+        FragmentKind.FULL,
+        FragmentKind.FULL,
+        FragmentKind.ATTENTION,
+    ]
+    assert [fragment.kind for fragment in plan.stage(1).fragments] == [
+        FragmentKind.FFN,
+        FragmentKind.FULL,
+        FragmentKind.FULL,
+        FragmentKind.FULL,
+    ]
+    assert all(
+        fragment.kind is FragmentKind.FULL
+        for stage in plan.stages[2:]
+        for fragment in stage.fragments
+    )
+    assert plan.stage(0).output_boundary is BoundaryKind.PACKED_ATTENTION
+    assert plan.stage(1).input_boundary is BoundaryKind.PACKED_ATTENTION
 
 
 def test_packed_boundary_custom_backward_after_deallocation():

@@ -25,7 +25,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
-    get_pipeline_layer_specs,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -410,10 +409,11 @@ def get_gpt_decoder_block_spec(
         else:
             raise ValueError(f"Invalid layer pattern: {moe_layer_pattern}")
 
-    layer_specs = get_pipeline_layer_specs(config, layer_specs)
-
-    # Block spec.
-    block_spec = TransformerBlockSubmodules(layer_specs=layer_specs, layer_norm=layer_norm_impl)
+    block_spec = TransformerBlockSubmodules(
+        layer_specs=layer_specs,
+        layer_norm=layer_norm_impl,
+        layer_specs_are_global=True,
+    )
 
     return block_spec
 

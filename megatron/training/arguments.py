@@ -510,8 +510,6 @@ def validate_args(args, defaults={}):
                         'Number of layers should be divisible by the pipeline-model-parallel size'
 
                 if args.decoder_num_half_layers_per_pipeline_stage is not None:
-                    assert args.split_all_layers, \
-                        '--decoder-num-half-layers-per-pipeline-stage requires --split-all-layers'
                     assert args.decoder_num_layers_per_pipeline_stage is None, \
                         '--decoder-num-half-layers-per-pipeline-stage is mutually exclusive with --decoder-num-layers-per-pipeline-stage'
                     assert len(args.decoder_num_half_layers_per_pipeline_stage) == args.transformer_pipeline_model_parallel_size, \
@@ -2102,7 +2100,7 @@ def _add_distributed_args(parser):
     group.add_argument('--decoder-num-half-layers-per-pipeline-stage',
                        type=int, default=None, nargs='+', metavar='N',
                        help=('Number of attention/FFN half-layers on each decoder pipeline stage. '
-                       'Requires --split-all-layers, must sum to num_layers*2, and is mutually '
+                       'Must sum to num_layers*2 and is mutually '
                        'exclusive with --decoder-num-layers-per-pipeline-stage.'))
 
     group.add_argument('--pipeline-split-layers',
@@ -2115,10 +2113,9 @@ def _add_distributed_args(parser):
 
     group.add_argument('--split-all-layers', action='store_true',
                        default=None,
-                       help=('Split EVERY transformer layer at the attention/FFN boundary. '
-                       'Each pipeline stage builds pairs of AttentionSubLayer + FFNSubLayer '
-                       'instead of full TransformerLayers. No cross-stage split occurs. '
-                       'Mutually exclusive with --pipeline-split-layers and VPP.'))
+                       help=('Deprecated compatibility flag. Co-located attention and FFN '
+                       'fragments are now materialized as full TransformerLayers. Use '
+                       '--decoder-num-half-layers-per-pipeline-stage for half-layer boundaries.'))
 
 
     group.add_argument('--model-parallel-size', type=int, default=None,

@@ -9,7 +9,7 @@ from torch.autograd.variable import Variable
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
-from megatron.core.pipeline_parallel.pipeline_partition import get_pipeline_stage_partition
+from megatron.core.pipeline_parallel.pipeline_partition import BoundaryKind, build_pipeline_plan
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
@@ -1635,21 +1635,13 @@ def get_tensor_shapes(
             tensor_shapes.append((decoder_seq_length, micro_batch_size, config.hidden_size))
     else:  # model_type == ModelType.encoder_or_decoder
         tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
-        if config.split_all_layers:
-            # A stage ending at attention packs the normalized output and residual
-            # into one tensor, preserving the standard one-tensor P2P contract.
-            partition = get_pipeline_stage_partition(config, rank)
-            if partition is not None and partition.ends_with_attention:
-                tensor_shapes[-1] = (2, seq_length, micro_batch_size, config.hidden_size)
-        elif config.pipeline_split_layers is not None:
-            if config.decoder_num_layers_per_pipeline_stage is not None:
-                boundary_layer = sum(config.decoder_num_layers_per_pipeline_stage[: rank + 1])
-            else:
-                boundary_layer = (rank + 1) * (
-                    config.num_layers // config.pipeline_model_parallel_size
-                )
-            if boundary_layer in config.pipeline_split_layers:
-                tensor_shapes[-1] = (2, seq_length, micro_batch_size, config.hidden_size)
+        plan = build_pipeline_plan(config)
+        if (
+            plan is not None
+            and 0 <= rank < len(plan.stages)
+            and plan.stage(rank).output_boundary is BoundaryKind.PACKED_ATTENTION
+        ):
+            tensor_shapes[-1] = (2, seq_length, micro_batch_size, config.hidden_size)
     return tensor_shapes
 
 
