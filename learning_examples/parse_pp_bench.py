@@ -1,179 +1,201 @@
 #!/usr/bin/env python3
-"""Parse half-layer PP benchmark logs into a clean comparison table.
+"""Parse structured PP benchmark logs and compare controlled experiments."""
 
-Usage: python parse_pp_bench.py [/tmp/pp_bench_*.log]
-       or just: python parse_pp_bench.py  (reads all /tmp/pp_bench_*.log)
-"""
-import re, sys, glob, os, statistics
+import argparse
+import csv
+import glob
+import json
+import math
+import os
+import re
+import statistics
+import sys
 
 
-def parse_int_list(value):
-    """Parse either a shell-style list ("11 13") or a Python list ("[11, 13]")."""
-    if not value or value.strip() == "None":
+META_PATTERN = re.compile(r'^\[BENCH-META\]\s+(\{.*\})$', re.MULTILINE)
+ITERATION_PATTERN = re.compile(
+    r'iteration\s+(\d+)/.*?elapsed time per iteration \(ms\):\s*([\d.]+)',
+    re.IGNORECASE,
+)
+
+
+def _percentile(values, percentile):
+    if not values:
         return None
-    return [int(item) for item in re.findall(r'\d+', value)] or None
+    ordered = sorted(values)
+    index = max(0, math.ceil(percentile * len(ordered)) - 1)
+    return ordered[index]
 
 
-def find_distribution(text, cli_option, config_key, debug_key=None):
-    """Read a stage distribution from CLI, Megatron config, or debug output."""
-    patterns = [
-        rf'--{re.escape(cli_option)}\s+([\d\s]+?)(?:\s+--|\s*\n|\s*$)',
-        rf'\b{re.escape(config_key)}\s+\.*\s+(\[[^\n]*\]|None)',
-    ]
-    if debug_key:
-        patterns.append(rf'\b{re.escape(debug_key)}=(\[[^\n]*?\]|None)')
+def _legacy_metadata(path, text):
+    """Best-effort compatibility for logs created before BENCH-META."""
+    name = os.path.basename(path).replace('.log', '').replace('pp_bench_', '')
+    pp_match = re.match(r'pp(\d+)', name)
 
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            distribution = parse_int_list(match.group(1))
-            if distribution is not None:
-                return distribution
-    return None
-
-
-def parse_log(path):
-    if not os.path.exists(path):
-        return None
-    with open(path) as f:
-        text = f.read()
-
-    # --- Config from filename ---
-    # e.g. pp2_baseline, pp4_split_uniform, pp2_half_layer_11_13
-    name = os.path.basename(path).replace(".log", "").replace("pp_bench_", "")
-    pp_size = 2 if name.startswith("pp2") else 4 if name.startswith("pp4") else None
-
-    # --- Config from log content ---
-    mode = "baseline"
-    decoder_num_layers = find_distribution(
-        text,
-        "decoder-num-layers-per-pipeline-stage",
-        "decoder_num_layers_per_pipeline_stage",
-        "decoder_dist",
-    )
-    decoder_num_half_layers = find_distribution(
-        text,
-        "decoder-num-half-layers-per-pipeline-stage",
-        "decoder_num_half_layers_per_pipeline_stage",
-        "half_dist",
-    )
-    pipeline_split_layers = find_distribution(
-        text,
-        "pipeline-split-layers",
-        "pipeline_split_layers",
-    )
-
-    split_all_enabled = (
-        '--split-all-layers' in text
-        or re.search(r'\bsplit_all=True\b', text)
-        or re.search(r'\bsplit_all_layers\s+\.*\s+True\b', text)
-    )
-    if split_all_enabled:
-        mode = "split-all"
-
-    if decoder_num_half_layers:
-        mode = "split-all(half)"
-
-    # If half-layer distribution was auto-derived, detect from log
-    m = re.search(r'auto-derived pipeline_split_layers=\[([\d,\s]*)\]', text)
-    if m and m.group(1).strip():
-        pipeline_split_layers = [int(x.strip()) for x in m.group(1).split(',')]
-
-    # --- Per-rank memory ---
-    # "[Rank 0] (after 1 iterations) memory (MB) | allocated: 956.1 | max allocated: 956.1"
-    rank_mems = {}
-    for m in re.finditer(
-        r'\[Rank (\d+)\].*?memory \(MB\)\s*\|\s*allocated:\s*([\d.]+)\s*\|\s*max allocated:\s*([\d.]+)',
-        text
-    ):
-        rank = int(m.group(1))
-        rank_mems[rank] = (float(m.group(2)), float(m.group(3)))
-
-    # --- Iteration times (skip iter 1 = compilation / CUDA graph capture) ---
-    # "elapsed time per iteration (ms): 641.8"
-    iter_times = []
-    for m in re.finditer(r'elapsed time per iteration \(ms\):\s*([\d.]+)', text):
-        t = float(m.group(1))
-        if t > 1000:  # skip compilation outlier
-            continue
-        iter_times.append(t)
-
-    # --- Total params ---
-    total_params = None
-    m = re.search(r'Total number of parameters in billions:\s*([\d.]+)', text)
-    if m:
-        total_params = float(m.group(1)) * 1000
-
-    # --- PP SCHEDULE bubble ---
-    bubble_est = None
-    m = re.search(r'bubble_est=([\d.]+)%', text)
-    if m:
-        bubble_est = float(m.group(1))
+    def distribution(option):
+        match = re.search(rf'--{option}\s+([\d\s]+?)(?:\s+--|\s*\n|\s*$)', text)
+        return [int(item) for item in match.group(1).split()] if match else None
 
     return {
-        'name': name, 'pp_size': pp_size, 'mode': mode,
-        'decoder_num_layers': decoder_num_layers,
-        'decoder_num_half_layers': decoder_num_half_layers,
-        'pipeline_split_layers': pipeline_split_layers,
-        'rank_mems': rank_mems,
-        'iter_times': iter_times,
-        'total_params': total_params,
-        'bubble_est': bubble_est,
+        'experiment': name,
+        'configuration': name,
+        'repeat': None,
+        'mode': 'legacy',
+        'pp': int(pp_match.group(1)) if pp_match else None,
+        'dp': None,
+        'tp': None,
+        'full_distribution': distribution('decoder-num-layers-per-pipeline-stage'),
+        'half_distribution': distribution('decoder-num-half-layers-per-pipeline-stage'),
+        'warmup_iters': 1,
     }
 
 
-def summarize(data):
-    if data is None:
-        return f"{'MISSING':28s}"
+def parse_log(path):
+    with open(path, encoding='utf-8', errors='replace') as log_file:
+        text = log_file.read()
 
-    # Config string
-    mode = data['mode']
-    cfg = ""
-    if data['decoder_num_half_layers']:
-        cfg = f"half=[{','.join(map(str, data['decoder_num_half_layers']))}]"
-    elif data['decoder_num_layers']:
-        cfg = f"full=[{','.join(map(str, data['decoder_num_layers']))}]"
-    if mode == 'baseline':
-        cfg = "uniform"
+    meta_match = META_PATTERN.search(text)
+    metadata = json.loads(meta_match.group(1)) if meta_match else _legacy_metadata(path, text)
+    warmup_iters = int(metadata.get('warmup_iters', 0))
 
-    # Iteration time (median, skip first warmup iter)
-    t = data['iter_times']
-    time_str = f"{statistics.median(t):.0f}ms" if t else "N/A"
+    samples = [
+        float(elapsed)
+        for iteration, elapsed in ITERATION_PATTERN.findall(text)
+        if int(iteration) > warmup_iters
+    ]
+    if not samples:
+        all_times = [
+            float(value)
+            for value in re.findall(r'elapsed time per iteration \(ms\):\s*([\d.]+)', text)
+        ]
+        samples = all_times[warmup_iters:]
 
-    # Memory: per-rank max_allocated, show each rank
-    mems = data['rank_mems']
-    if mems:
-        mem_str = "  ".join(f"R{r}={int(v[1])}MiB" for r, v in sorted(mems.items()))
-    else:
-        mem_str = "N/A"
+    rank_memory = {}
+    for match in re.finditer(
+        r'\[Rank (\d+)\].*?memory \(MB\).*?max allocated:\s*([\d.]+)', text
+    ):
+        rank = int(match.group(1))
+        rank_memory[rank] = max(rank_memory.get(rank, 0.0), float(match.group(2)))
 
-    pp = data.get('pp_size', '?')
+    rank_params = {}
+    for match in re.finditer(r'\[MODEL\] RANK=\s*(\d+).*?params=([\d.]+)M', text):
+        rank_params[int(match.group(1))] = float(match.group(2))
 
-    return (f"{data['name']:28s}  {mem_str:>50s}  {time_str:>8s}  "
-            f"PP={pp}  {mode:12s}  {cfg}")
+    phase_totals = {}
+    for match in re.finditer(r'\[PP TIMING\].*?RANK=(\d+).*?total=([\d.]+)ms', text):
+        phase_totals.setdefault(int(match.group(1)), []).append(float(match.group(2)))
+    rank_phase_medians = {
+        rank: statistics.median(values[warmup_iters:])
+        for rank, values in phase_totals.items()
+        if values[warmup_iters:]
+    }
+
+    result = dict(metadata)
+    result.update(
+        path=path,
+        complete='[before the start of training step]' in text and bool(samples),
+        samples=len(samples),
+        median_ms=statistics.median(samples) if samples else None,
+        p95_ms=_percentile(samples, 0.95),
+        min_ms=min(samples) if samples else None,
+        max_ms=max(samples) if samples else None,
+        max_memory_mib=max(rank_memory.values()) if rank_memory else None,
+        memory_imbalance_mib=(
+            max(rank_memory.values()) - min(rank_memory.values()) if rank_memory else None
+        ),
+        parameter_imbalance_m=(
+            max(rank_params.values()) - min(rank_params.values()) if rank_params else None
+        ),
+        stage_time_ratio=(
+            max(rank_phase_medians.values()) / min(rank_phase_medians.values())
+            if rank_phase_medians and min(rank_phase_medians.values()) > 0
+            else None
+        ),
+    )
+    return result
+
+
+def _format_distribution(result):
+    if result.get('half_distribution'):
+        return 'half=' + str(result['half_distribution']).replace(' ', '')
+    if result.get('full_distribution'):
+        return 'full=' + str(result['full_distribution']).replace(' ', '')
+    return 'default'
+
+
+def print_table(results):
+    header = (
+        f"{'Experiment':30} {'Mode':28} {'Distribution':22} "
+        f"{'N':>4} {'Median':>9} {'P95':>9} {'MaxMem':>10} {'StageRatio':>10}"
+    )
+    print(header)
+    print('-' * len(header))
+    for result in results:
+        median = f"{result['median_ms']:.1f}ms" if result['median_ms'] is not None else 'N/A'
+        p95 = f"{result['p95_ms']:.1f}ms" if result['p95_ms'] is not None else 'N/A'
+        memory = (
+            f"{result['max_memory_mib']:.0f}MiB"
+            if result['max_memory_mib'] is not None else 'N/A'
+        )
+        ratio = (
+            f"{result['stage_time_ratio']:.3f}"
+            if result['stage_time_ratio'] is not None else 'N/A'
+        )
+        print(
+            f"{result['experiment']:30} {result.get('mode', '?'):28} "
+            f"{_format_distribution(result):22} {result['samples']:4d} "
+            f"{median:>9} {p95:>9} {memory:>10} {ratio:>10}"
+        )
+
+    groups = {}
+    for result in results:
+        groups.setdefault(result.get('configuration', result['experiment']), []).append(result)
+    if any(len(group) > 1 for group in groups.values()):
+        print('\nConfiguration aggregates (median of run medians):')
+        print(f"{'Configuration':30} {'Runs':>4} {'Median':>9} {'Range':>20}")
+        print('-' * 67)
+        for configuration, group in groups.items():
+            medians = [item['median_ms'] for item in group if item['median_ms'] is not None]
+            if not medians:
+                continue
+            print(
+                f"{configuration:30} {len(medians):4d} "
+                f"{statistics.median(medians):8.1f}ms "
+                f"[{min(medians):.1f}, {max(medians):.1f}]ms"
+            )
+
+
+def write_csv(path, results):
+    fields = [
+        'experiment', 'configuration', 'repeat', 'mode', 'pp', 'dp', 'tp', 'full_distribution',
+        'half_distribution', 'samples', 'median_ms', 'p95_ms', 'min_ms',
+        'max_ms', 'max_memory_mib', 'memory_imbalance_mib',
+        'parameter_imbalance_m', 'stage_time_ratio', 'complete', 'path',
+    ]
+    with open(path, 'w', newline='', encoding='utf-8') as output:
+        writer = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(results)
 
 
 def main():
-    logs = sys.argv[1:] if len(sys.argv) > 1 else sorted(glob.glob("/tmp/pp_bench_*.log"))
-    if not logs:
-        print("No log files. Usage: python parse_pp_bench.py <log1> [log2 ...]")
-        sys.exit(1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('logs', nargs='*')
+    parser.add_argument('--csv', dest='csv_path')
+    args = parser.parse_args()
 
-    header = (f"{'Config':28s}  {'Memory (max allocated per rank)':>50s}  {'Time(median)':>8s}  "
-              f"{'PP':>4s}  {'Mode':12s}  {'Distribution'}")
-    print(header)
-    print("-" * len(header))
+    paths = args.logs or sorted(glob.glob('/tmp/pp4_partition_bench/*.log'))
+    if not paths:
+        parser.error('no benchmark logs found')
 
-    results = []
-    for path in sorted(logs):
-        data = parse_log(path)
-        if data:
-            results.append(data)
-            print(summarize(data))
+    results = [parse_log(path) for path in sorted(paths)]
+    print_table(results)
+    if args.csv_path:
+        write_csv(args.csv_path, results)
 
-    if not results:
-        print("No valid log files found.")
+    if any(result['samples'] == 0 for result in results):
+        sys.exit(2)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

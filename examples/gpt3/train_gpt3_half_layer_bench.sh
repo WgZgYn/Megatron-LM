@@ -1,124 +1,119 @@
 #!/bin/bash
 
-# Half-layer PP benchmark: baseline vs split_all_layers.
-# 4xV100, PP=2 or PP=4, TP=1, DP=1.
-# Usage: bash train_gpt3_half_layer_bench.sh <VOCAB_FILE> <MERGE_FILE>
+# Controlled PP=4 comparison for default, uneven full-layer, and half-layer plans.
+# Usage: bash examples/gpt3/train_gpt3_half_layer_bench.sh VOCAB_FILE MERGE_FILE
+# Optional: ONLY_EXPERIMENT=pp4_manual_uniform bash ...
 
-set -e
+set -euo pipefail
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-# Fixed: 2 GPUs for PP=2, 4 GPUs for PP=4.  DP=1 in all tests to isolate PP effect.
-# TP=1 throughout (no tensor parallelism).
-MASTER_ADDR=localhost
-MASTER_PORT=6000
-NUM_NODES=1
-NODE_RANK=0
-
-VOCAB_FILE=$1; MERGE_FILE=$2
-if [ -z "$VOCAB_FILE" ] || [ -z "$MERGE_FILE" ]; then
-    echo "Usage: bash train_gpt3_half_layer_bench.sh <VOCAB_FILE> <MERGE_FILE>"
+VOCAB_FILE=${1:-}
+MERGE_FILE=${2:-}
+if [[ -z "$VOCAB_FILE" || -z "$MERGE_FILE" ]]; then
+    echo "Usage: $0 VOCAB_FILE MERGE_FILE"
     exit 1
 fi
 
-DISTRIBUTED_ARGS=(--nnodes $NUM_NODES
-                  --master_addr $MASTER_ADDR --master_port $MASTER_PORT)
+MASTER_ADDR=${MASTER_ADDR:-localhost}
+MASTER_PORT=${MASTER_PORT:-6000}
+TRAIN_ITERS=${TRAIN_ITERS:-60}
+WARMUP_ITERS=${WARMUP_ITERS:-10}
+REPEATS=${REPEATS:-3}
+LOG_DIR=${LOG_DIR:-/tmp/pp4_partition_bench}
+mkdir -p "$LOG_DIR"
 
-# 12 layers, hidden=768, ~124M params, mock data, fp16
-GPT_MODEL_ARGS=(--num-layers 12 --hidden-size 768 --num-attention-heads 12
-                --seq-length 128 --max-position-embeddings 128)
+DISTRIBUTED_ARGS=(
+    --nproc_per_node 4
+    --nnodes 1
+    --master_addr "$MASTER_ADDR"
+    --master_port "$MASTER_PORT"
+)
 
-TRAINING_ARGS=(--micro-batch-size 2 --global-batch-size 16 --train-iters 30
-               --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.95
-               --init-method-std 0.006 --clip-grad 1.0 --fp16
-               --lr 6.0e-5 --lr-decay-style cosine --min-lr 6.0e-6
-               --lr-warmup-fraction .001)
+MODEL_ARGS=(
+    --num-layers 12
+    --hidden-size 768
+    --num-attention-heads 12
+    --seq-length 128
+    --max-position-embeddings 128
+)
 
-DATA_ARGS=(--mock-data --vocab-file $VOCAB_FILE --merge-file $MERGE_FILE --split 949,50,1)
-EVAL_ARGS=(--log-interval 1 --eval-interval 100 --eval-iters 0)
+TRAIN_ARGS=(
+    --micro-batch-size 2
+    --global-batch-size 32
+    --train-iters "$TRAIN_ITERS"
+    --weight-decay 0.1
+    --adam-beta1 0.9
+    --adam-beta2 0.95
+    --init-method-std 0.006
+    --clip-grad 1.0
+    --fp16
+    --lr 6.0e-5
+    --lr-decay-style cosine
+    --min-lr 6.0e-6
+    --lr-warmup-fraction .001
+)
+
+DATA_ARGS=(
+    --mock-data
+    --vocab-file "$VOCAB_FILE"
+    --merge-file "$MERGE_FILE"
+    --split 949,50,1
+)
+
+LOG_ARGS=(--log-interval 1 --eval-interval 1000 --eval-iters 0)
+PARALLEL_ARGS=(--tensor-model-parallel-size 1 --pipeline-model-parallel-size 4)
 
 run_exp() {
-    local gpus="$1"; local label="$2"; shift 2
-    if [ -n "${ONLY_EXPERIMENT:-}" ] && [ "$ONLY_EXPERIMENT" != "$label" ]; then
+    local label=$1
+    local mode=$2
+    local full_dist=$3
+    local half_dist=$4
+    shift 4
+
+    if [[ -n "${ONLY_EXPERIMENT:-}" && "$ONLY_EXPERIMENT" != "$label" ]]; then
         return
     fi
-    echo "==== $label (${gpus} GPUs, DP=1, TP=1) ===="
-    torchrun --nproc_per_node $gpus ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
-        ${GPT_MODEL_ARGS[@]} ${TRAINING_ARGS[@]} "$@" ${DATA_ARGS[@]} ${EVAL_ARGS[@]} \
-        2>&1 | tee "/tmp/pp_bench_${label}.log"
-    echo ""
+
+    local repeat
+    for repeat in $(seq 1 "$REPEATS"); do
+        local experiment="${label}_r${repeat}"
+        local log_path="$LOG_DIR/pp_bench_${experiment}.log"
+        {
+            printf '[BENCH-META] {"experiment":"%s","configuration":"%s","repeat":%s,' \
+                "$experiment" "$label" "$repeat"
+            printf '"mode":"%s","pp":4,"dp":1,"tp":1,' "$mode"
+            printf '"num_layers":12,"full_distribution":%s,"half_distribution":%s,' \
+                "$full_dist" "$half_dist"
+            printf '"micro_batch_size":2,"global_batch_size":32,"sequence_length":128,'
+            printf '"train_iters":%s,"warmup_iters":%s}\n' "$TRAIN_ITERS" "$WARMUP_ITERS"
+
+            MEGATRON_DEBUG_LOG=1 PP_TIMING_INTERVAL=1 torchrun "${DISTRIBUTED_ARGS[@]}" \
+                pretrain_gpt.py "${MODEL_ARGS[@]}" "${TRAIN_ARGS[@]}" \
+                "${PARALLEL_ARGS[@]}" "$@" "${DATA_ARGS[@]}" "${LOG_ARGS[@]}"
+        } 2>&1 | tee "$log_path"
+    done
 }
 
-# ═══ PP=2 experiments ═══
+# E0/E1 isolate the overhead of supplying an explicit but identical plan.
+run_exp "pp4_default_uniform" "default_uniform" "[3,3,3,3]" "null"
+run_exp "pp4_manual_uniform" "manual_uniform" "[3,3,3,3]" "null" \
+    --decoder-num-layers-per-pipeline-stage 3 3 3 3
 
-echo "=== PP=2: 2 GPUs, DP=1, TP=1 (6+6 full layers per stage) ==="
-echo ""
+# E2/E3 compare Megatron's first/last-stage interface with the equivalent plan.
+run_exp "pp4_first_last_2_2" "native_first_last" "[2,4,4,2]" "null" \
+    --decoder-first-pipeline-num-layers 2 --decoder-last-pipeline-num-layers 2
+run_exp "pp4_explicit_2_4_4_2" "manual_first_last_equivalent" "[2,4,4,2]" "null" \
+    --decoder-num-layers-per-pipeline-stage 2 4 4 2
 
-# A1) Baseline: PP=2 uniform whole layers, 2 GPUs
-run_exp 2 "pp2_baseline" \
-    --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2
+# E4 is a moderate perturbation; E5 deliberately creates a severe bottleneck.
+run_exp "pp4_uneven_2_3_4_3" "moderate_uneven" "[2,3,4,3]" "null" \
+    --decoder-num-layers-per-pipeline-stage 2 3 4 3
+run_exp "pp4_uneven_1_2_6_3" "severe_uneven" "[1,2,6,3]" "null" \
+    --decoder-num-layers-per-pipeline-stage 1 2 6 3
 
-# A2) Split-all: same model, pure overhead test
-run_exp 2 "pp2_split_uniform" \
-    --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
-    --split-all-layers
+# E6 moves half a layer from stage 0 to stage 1. Only layer 3 crosses a stage.
+run_exp "pp4_half_5_7_6_6" "half_layer" "null" "[5,7,6,6]" \
+    --decoder-num-half-layers-per-pipeline-stage 5 7 6 6
 
-# A3) Uneven full-layer allocation: GPU0=4 layers, GPU1=8 layers.
-run_exp 2 "pp2_split_uneven_4_8" \
-    --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
-    --split-all-layers --decoder-num-layers-per-pipeline-stage 4 8
-
-# A4) Uneven full-layer allocation: GPU0=3 layers, GPU1=9 layers.
-run_exp 2 "pp2_split_uneven_3_9" \
-    --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
-    --split-all-layers --decoder-num-layers-per-pipeline-stage 3 9
-
-# A5) Half-layer granularity: 11+13 half-layers, auto-split at layer 6
-#     Half-layer counts use a dedicated argument and sum to 12*2 = 24.
-run_exp 2 "pp2_half_layer_11_13" \
-    --tensor-model-parallel-size 1 --pipeline-model-parallel-size 2 \
-    --split-all-layers --decoder-num-half-layers-per-pipeline-stage 11 13
-
-# ═══ PP=4 experiments ═══
-
-echo "=== PP=4: 4 GPUs, DP=1, TP=1 (3+3+3+3 full layers per stage) ==="
-echo ""
-
-# B1) Baseline: PP=4 uniform whole layers
-run_exp 4 "pp4_baseline" \
-    --tensor-model-parallel-size 1 --pipeline-model-parallel-size 4
-
-# B2) Split-all: same model, pure overhead test
-run_exp 4 "pp4_split_uniform" \
-    --tensor-model-parallel-size 1 --pipeline-model-parallel-size 4 \
-    --split-all-layers
-
-# B3) Half-layer granularity: [5,7,6,6] half-layers → auto split at layer 3
-#     The odd prefix cuts layer 3 between attention and FFN.
-run_exp 4 "pp4_half_layer_5_7_6_6" \
-    --tensor-model-parallel-size 1 --pipeline-model-parallel-size 4 \
-    --split-all-layers --decoder-num-half-layers-per-pipeline-stage 5 7 6 6
-
-# B4) Uneven full-layer allocation: [1,2,5,4].
-#     GPU0 light, GPU2 heavy
-run_exp 4 "pp4_split_uneven_2_4_10_8" \
-    --tensor-model-parallel-size 1 --pipeline-model-parallel-size 4 \
-    --split-all-layers --decoder-num-layers-per-pipeline-stage 1 2 5 4
-
-echo ""
-echo "=== SUMMARY ==="
-echo "PP=2 (2 GPUs, DP=1, TP=1) logs:"
-echo "  A1 baseline:     /tmp/pp_bench_pp2_baseline.log"
-echo "  A2 split uniform: /tmp/pp_bench_pp2_split_uniform.log"
-echo "  A3 split 4+8:     /tmp/pp_bench_pp2_split_uneven_4_8.log"
-echo "  A4 split 3+9:     /tmp/pp_bench_pp2_split_uneven_3_9.log"
-echo "  A5 half-layer 11+13: /tmp/pp_bench_pp2_half_layer_11_13.log"
-echo "PP=4 (4 GPUs, DP=1, TP=1) logs:"
-echo "  B1 baseline:     /tmp/pp_bench_pp4_baseline.log"
-echo "  B2 split uniform: /tmp/pp_bench_pp4_split_uniform.log"
-echo "  B3 half-layer 5+7+6+6: /tmp/pp_bench_pp4_half_layer_5_7_6_6.log"
-echo "  B4 split 2+4+10+8: /tmp/pp_bench_pp4_split_uneven_2_4_10_8.log"
-echo ""
-echo "Key numbers to compare (grep from logs):"
-echo "  'number of parameters'  → per-rank params"
-echo "  'mem_used'              → per-rank memory (MiB)"
-echo "  'elapsed'               → per-iteration time (ms)"
+echo "Logs: $LOG_DIR"
+echo "Parse: python learning_examples/parse_pp_bench.py $LOG_DIR/*.log"
