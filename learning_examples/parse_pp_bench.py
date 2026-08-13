@@ -6,6 +6,32 @@ Usage: python parse_pp_bench.py [/tmp/pp_bench_*.log]
 """
 import re, sys, glob, os, statistics
 
+
+def parse_int_list(value):
+    """Parse either a shell-style list ("11 13") or a Python list ("[11, 13]")."""
+    if not value or value.strip() == "None":
+        return None
+    return [int(item) for item in re.findall(r'\d+', value)] or None
+
+
+def find_distribution(text, cli_option, config_key, debug_key=None):
+    """Read a stage distribution from CLI, Megatron config, or debug output."""
+    patterns = [
+        rf'--{re.escape(cli_option)}\s+([\d\s]+?)(?:\s+--|\s*\n|\s*$)',
+        rf'\b{re.escape(config_key)}\s+\.*\s+(\[[^\n]*\]|None)',
+    ]
+    if debug_key:
+        patterns.append(rf'\b{re.escape(debug_key)}=(\[[^\n]*?\]|None)')
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            distribution = parse_int_list(match.group(1))
+            if distribution is not None:
+                return distribution
+    return None
+
+
 def parse_log(path):
     if not os.path.exists(path):
         return None
@@ -19,31 +45,34 @@ def parse_log(path):
 
     # --- Config from log content ---
     mode = "baseline"
-    decoder_num_layers = None
-    pipeline_split_layers = None
+    decoder_num_layers = find_distribution(
+        text,
+        "decoder-num-layers-per-pipeline-stage",
+        "decoder_num_layers_per_pipeline_stage",
+        "decoder_dist",
+    )
+    decoder_num_half_layers = find_distribution(
+        text,
+        "decoder-num-half-layers-per-pipeline-stage",
+        "decoder_num_half_layers_per_pipeline_stage",
+        "half_dist",
+    )
+    pipeline_split_layers = find_distribution(
+        text,
+        "pipeline-split-layers",
+        "pipeline_split_layers",
+    )
 
-    if '--split-all-layers' in text or 'split_all_layers' in text:
+    split_all_enabled = (
+        '--split-all-layers' in text
+        or re.search(r'\bsplit_all=True\b', text)
+        or re.search(r'\bsplit_all_layers\s+\.*\s+True\b', text)
+    )
+    if split_all_enabled:
         mode = "split-all"
 
-    m = re.search(r'--decoder-num-layers-per-pipeline-stage\s+([\d\s]+?)(?:\s+--|\s*\n|\s*$)', text)
-    if m:
-        try:
-            decoder_num_layers = [int(x) for x in m.group(1).split()]
-        except: pass
-
-    # Detect half-layer mode: split_all_layers + sum = num_layers*2
-    if mode == "split-all" and decoder_num_layers:
-        total = sum(decoder_num_layers)
-        # If the distribution would make sense as half-layers (sum ~ num_layers*2)
-        # we're in half-layer mode. Otherwise it's full-layer-with-internal-split.
-        if total == 12 * 2:  # 12 layers = 24 half-layers for current model
-            mode = "split-all(half)" if any(n % 2 == 1 for n in decoder_num_layers) else "split-all"
-
-    m = re.search(r'--pipeline-split-layers\s+([\d\s]+?)(?:\s+--|\s*\n|\s*$)', text)
-    if m:
-        try:
-            pipeline_split_layers = [int(x) for x in m.group(1).split()]
-        except: pass
+    if decoder_num_half_layers:
+        mode = "split-all(half)"
 
     # If half-layer distribution was auto-derived, detect from log
     m = re.search(r'auto-derived pipeline_split_layers=\[([\d,\s]*)\]', text)
@@ -100,7 +129,9 @@ def summarize(data):
     # Config string
     mode = data['mode']
     cfg = ""
-    if data['decoder_num_layers']:
+    if data['decoder_num_half_layers']:
+        cfg = f"half=[{','.join(map(str, data['decoder_num_half_layers']))}]"
+    elif data['decoder_num_layers']:
         cfg = f"full=[{','.join(map(str, data['decoder_num_layers']))}]"
     if mode == 'baseline':
         cfg = "uniform"
