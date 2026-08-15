@@ -20,14 +20,14 @@ near-best half-layer comparison for this phase:
 | Near-best A | `[4,8,9,3]` | Does moving half a layer from the final stage help? |
 | Near-best B | `[5,8,8,3]` | Does moving one half-layer from the final to first stage help? |
 
-Keep PP=4, TP=1, DP=1, model shape, sequence length, microbatch count, and
-repeat policy fixed. Treat these experiments as a completed allocation matrix,
-not as an open-ended search.
+Keep PP=4, TP=1, DP=1, `micro_batch_size=2`, `global_batch_size=16`, model
+shape, sequence length, and repeat policy fixed. Treat these experiments as a
+completed allocation matrix, not as an open-ended search.
 
 ## Phase 1: finish the controlled experiment
 
 Run the existing script three times per configuration, parse the logs, and
-record median, P95, maximum memory, and rank-level timing. A candidate is only
+record median, P95, all rank memory values (`R0` through `R3`), and rank-level timing. A candidate is only
 interesting if its independent-run median improves without a worse P95 or a
 new communication error. Do not claim a half-layer benefit from one run.
 

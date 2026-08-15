@@ -16,9 +16,10 @@ fi
 
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
-TRAIN_ITERS=${TRAIN_ITERS:-60}
+TRAIN_ITERS=${TRAIN_ITERS:-40}
 WARMUP_ITERS=${WARMUP_ITERS:-10}
 REPEATS=${REPEATS:-3}
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-16}
 LOG_DIR=${LOG_DIR:-/tmp/pp4_partition_bench}
 mkdir -p "$LOG_DIR"
 
@@ -39,7 +40,7 @@ MODEL_ARGS=(
 
 TRAIN_ARGS=(
     --micro-batch-size 2
-    --global-batch-size 32
+    --global-batch-size "$GLOBAL_BATCH_SIZE"
     --train-iters "$TRAIN_ITERS"
     --weight-decay 0.1
     --adam-beta1 0.9
@@ -84,10 +85,11 @@ run_exp() {
             printf '"mode":"%s","pp":4,"dp":1,"tp":1,' "$mode"
             printf '"num_layers":12,"full_distribution":%s,"half_distribution":%s,' \
                 "$full_dist" "$half_dist"
-            printf '"micro_batch_size":2,"global_batch_size":32,"sequence_length":128,'
+            printf '"micro_batch_size":2,"global_batch_size":%s,"sequence_length":128,' \
+                "$GLOBAL_BATCH_SIZE"
             printf '"train_iters":%s,"warmup_iters":%s}\n' "$TRAIN_ITERS" "$WARMUP_ITERS"
 
-            MEGATRON_DEBUG_LOG=1 PP_TIMING_INTERVAL=1 torchrun "${DISTRIBUTED_ARGS[@]}" \
+            torchrun "${DISTRIBUTED_ARGS[@]}" \
                 pretrain_gpt.py "${MODEL_ARGS[@]}" "${TRAIN_ARGS[@]}" \
                 "${PARALLEL_ARGS[@]}" "$@" "${DATA_ARGS[@]}" "${LOG_ARGS[@]}"
         } 2>&1 | tee "$log_path"

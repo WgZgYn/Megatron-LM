@@ -99,7 +99,11 @@ def parse_log(path):
         p95_ms=_percentile(samples, 0.95),
         min_ms=min(samples) if samples else None,
         max_ms=max(samples) if samples else None,
-        max_memory_mib=max(rank_memory.values()) if rank_memory else None,
+        rank_memory_mib=rank_memory,
+        rank0_memory_mib=rank_memory.get(0),
+        rank1_memory_mib=rank_memory.get(1),
+        rank2_memory_mib=rank_memory.get(2),
+        rank3_memory_mib=rank_memory.get(3),
         memory_imbalance_mib=(
             max(rank_memory.values()) - min(rank_memory.values()) if rank_memory else None
         ),
@@ -126,25 +130,24 @@ def _format_distribution(result):
 def print_table(results):
     header = (
         f"{'Experiment':30} {'Mode':28} {'Distribution':22} "
-        f"{'N':>4} {'Median':>9} {'P95':>9} {'MaxMem':>10} {'StageRatio':>10}"
+        f"{'N':>4} {'Median':>9} {'P95':>9} "
+        f"{'R0':>8} {'R1':>8} {'R2':>8} {'R3':>8}"
     )
     print(header)
     print('-' * len(header))
     for result in results:
         median = f"{result['median_ms']:.1f}ms" if result['median_ms'] is not None else 'N/A'
         p95 = f"{result['p95_ms']:.1f}ms" if result['p95_ms'] is not None else 'N/A'
-        memory = (
-            f"{result['max_memory_mib']:.0f}MiB"
-            if result['max_memory_mib'] is not None else 'N/A'
-        )
-        ratio = (
-            f"{result['stage_time_ratio']:.3f}"
-            if result['stage_time_ratio'] is not None else 'N/A'
-        )
+        rank_memory = result.get('rank_memory_mib', {})
+        memory = [
+            f"{rank_memory[rank]:.0f}MiB" if rank in rank_memory else '-'
+            for rank in range(4)
+        ]
         print(
             f"{result['experiment']:30} {result.get('mode', '?'):28} "
             f"{_format_distribution(result):22} {result['samples']:4d} "
-            f"{median:>9} {p95:>9} {memory:>10} {ratio:>10}"
+            f"{median:>9} {p95:>9} "
+            f"{memory[0]:>8} {memory[1]:>8} {memory[2]:>8} {memory[3]:>8}"
         )
 
     groups = {}
@@ -169,7 +172,8 @@ def write_csv(path, results):
     fields = [
         'experiment', 'configuration', 'repeat', 'mode', 'pp', 'dp', 'tp', 'full_distribution',
         'half_distribution', 'samples', 'median_ms', 'p95_ms', 'min_ms',
-        'max_ms', 'max_memory_mib', 'memory_imbalance_mib',
+        'max_ms', 'rank0_memory_mib', 'rank1_memory_mib', 'rank2_memory_mib',
+        'rank3_memory_mib', 'memory_imbalance_mib',
         'parameter_imbalance_m', 'stage_time_ratio', 'complete', 'path',
     ]
     with open(path, 'w', newline='', encoding='utf-8') as output:
