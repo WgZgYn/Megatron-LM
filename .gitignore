@@ -15,4 +15,6 @@ onelogger.err
 # local experiments
 learning_examples/*
 !learning_examples/16_next_phase_research_plan.md
+!learning_examples/17_local_profiling_guide_zh.md
+!learning_examples/profile_transformer_local.py
 .idea/
