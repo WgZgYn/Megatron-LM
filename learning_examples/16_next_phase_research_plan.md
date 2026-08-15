@@ -24,6 +24,15 @@ Keep PP=4, TP=1, DP=1, `micro_batch_size=2`, `global_batch_size=16`, model
 shape, sequence length, and repeat policy fixed. Treat these experiments as a
 completed allocation matrix, not as an open-ended search.
 
+After the small-profile conclusion is recorded, run the script with
+`BENCH_PROFILE=large`. It keeps the 12-layer model unchanged and uses
+`seq_length=1024`, `micro_batch_size=8`, `global_batch_size=64`, 1500 training
+iterations, `attention-backend=auto`, and `lr_decay_iters=1000`. The resulting
+eight microbatches per iteration preserve the small experiment's pipeline
+schedule. Run only the default, `[2,4,4,2]`, `[4,8,9,3]`, and `[5,8,8,3]`
+cases. First verify the default case fits in GPU memory before launching the
+full matrix.
+
 ## Phase 1: finish the controlled experiment
 
 Run the existing script three times per configuration, parse the logs, and

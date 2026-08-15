@@ -63,6 +63,27 @@ coordinate is `[4,8,8,4]`; the two near-best candidates intentionally change
 only one half-layer boundary at a time. Keep this small matrix fixed after
 these candidates are tested, unless profiling identifies a measurement issue.
 
+### Large profile
+
+Run the same script with `BENCH_PROFILE=large`. This profile keeps the model at
+12 layers and hidden size 768 but uses sequence length 1024, micro batch size 8,
+global batch size 64, 1500 training iterations, `attention-backend=auto`, and
+the large-profile learning-rate schedule. It keeps eight microbatches per
+iteration, matching the small profile's pipeline schedule.
+
+The large profile only runs the small-profile reference, winner, and two
+nearby half-layer candidates:
+
+| Case | Distribution | Purpose |
+|---|---|---|
+| Large default | full `[3,3,3,3]` | Scale reference |
+| Large explicit winner | full `[2,4,4,2]` | Confirm full-layer winner at larger compute |
+| Large half A | half `[4,8,9,3]` | Confirm stage-2 boundary adjustment |
+| Large half B | half `[5,8,8,3]` | Confirm first-stage boundary adjustment |
+
+Large logs use distinct experiment names and must not be mixed with the small
+profile when drawing conclusions.
+
 ## Validation gates
 
 1. Planner unit tests: intervals, fragments, boundary kinds, invalid configs.
