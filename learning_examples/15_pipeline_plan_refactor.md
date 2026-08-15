@@ -67,9 +67,12 @@ these candidates are tested, unless profiling identifies a measurement issue.
 
 Run the same script with `BENCH_PROFILE=large`. This profile keeps the model at
 12 layers and hidden size 768 but uses sequence length 1024, micro batch size 8,
-global batch size 64, 1500 training iterations, `attention-backend=auto`, and
-the large-profile learning-rate schedule. It keeps eight microbatches per
-iteration, matching the small profile's pipeline schedule.
+global batch size 64, `attention-backend=auto`, and the large-profile
+learning-rate schedule. Its validation defaults are one repeat with 30 training
+iterations, of which the first five are excluded. It keeps eight microbatches
+per iteration, matching the small profile's pipeline schedule. A later formal
+run can set `REPEATS=3 TRAIN_ITERS=1500 WARMUP_ITERS=100` without editing the
+script.
 
 The large profile only runs the small-profile reference, winner, and two
 nearby half-layer candidates:
