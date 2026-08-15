@@ -111,9 +111,16 @@ run_exp "pp4_uneven_2_3_4_3" "moderate_uneven" "[2,3,4,3]" "null" \
 run_exp "pp4_uneven_1_2_6_3" "severe_uneven" "[1,2,6,3]" "null" \
     --decoder-num-layers-per-pipeline-stage 1 2 6 3
 
-# E6 moves half a layer from stage 0 to stage 1. Only layer 3 crosses a stage.
+# E6 is the original half-layer baseline. Only layer 3 crosses a stage.
 run_exp "pp4_half_5_7_6_6" "half_layer" "null" "[5,7,6,6]" \
     --decoder-num-half-layers-per-pipeline-stage 5 7 6 6
+
+# E7/E8 stay close to the best full-layer plan [2,4,4,2], whose half-layer
+# coordinate is [4,8,8,4]. They change one edge boundary at a time.
+run_exp "pp4_half_4_8_9_3" "half_near_best_move_to_stage2" "null" "[4,8,9,3]" \
+    --decoder-num-half-layers-per-pipeline-stage 4 8 9 3
+run_exp "pp4_half_5_8_8_3" "half_near_best_reduce_edges" "null" "[5,8,8,3]" \
+    --decoder-num-half-layers-per-pipeline-stage 5 8 8 3
 
 echo "Logs: $LOG_DIR"
 echo "Parse: python learning_examples/parse_pp_bench.py $LOG_DIR/*.log"

@@ -47,11 +47,18 @@ micro batch size, global batch size, and number of microbatches.
 | Equivalent explicit | full `[2,4,4,2]` | Check semantic and performance equivalence |
 | Moderate uneven | full `[2,3,4,3]` | Plausible load adjustment |
 | Severe uneven | full `[1,2,6,3]` | Deliberate stage bottleneck |
-| Half-layer | half `[5,7,6,6]` | Finer boundary at layer 3 |
+| Half-layer baseline | half `[5,7,6,6]` | Finer boundary at layer 3 |
+| Half-layer near best A | half `[4,8,9,3]` | Move one half-layer from final stage to stage 2 |
+| Half-layer near best B | half `[5,8,8,3]` | Move one half-layer from the final stage to the first stage |
 
 Each configuration runs in three independent processes by default. The first
 ten training iterations are excluded. Report the median and P95 within each run,
 then the median and range of the independent run medians.
+
+The current best full-layer result is `[2,4,4,2]`. Its equivalent half-layer
+coordinate is `[4,8,8,4]`; the two near-best candidates intentionally change
+only one half-layer boundary at a time. Keep this small matrix fixed after
+these candidates are tested, unless profiling identifies a measurement issue.
 
 ## Validation gates
 

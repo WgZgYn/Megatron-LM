@@ -13,5 +13,6 @@ wandb/
 onelogger.log
 onelogger.err
 # local experiments
-learning_examples/
+learning_examples/*
+!learning_examples/16_next_phase_research_plan.md
 .idea/
