@@ -1,0 +1,8 @@
+# Profiling outputs (traces, comm logs, plots) are large and machine-generated.
+outputs/
+*.jsonl
+*.nsys-rep
+*.qdrep
+*.sqlite
+__pycache__/
+*.pyc

@@ -1,0 +1,10 @@
+# Runtime requirements for the profiling harness (in addition to a CUDA torch).
+# The local venv (F:\PycharmProjects\llm\.venv) already has torch 2.12.1+cu126.
+#
+#   torch>=2.1        # torch.profiler, DDP, NCCL/GLOO, torchrun
+#   matplotlib>=3.7   # analyze.py plots
+#   pandas>=2.0       # analyze.py aggregation (optional, falls back to stdlib)
+#
+# Remote servers: install with the same torch wheel that matches their CUDA.
+# Nothing here is pinned to a specific Megatron version; the harness is standalone.
+matplotlib>=3.7
