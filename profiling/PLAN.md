@@ -35,8 +35,10 @@ TP 的 `ColumnParallelLinear` 前向不通信、反向对输入梯度 all-reduce
    `comm_rankN.jsonl`（op、bytes、ms、gbps）。这是「带宽/时延」量化的权威来源，
    由 `analyze.py` 汇总。
 
-> 注意：`--measure-comm` 打开时 DDP 的梯度 all-reduce 走**同步**路径（便于测单桶时延），
-> 会牺牲梯度/反向的重叠。要看真实的 DDP 重叠时间轴，用 `--no-measure-comm` 单独跑一次 trace。
+> 计时方式（v2）：**阻塞** collective（TP all-reduce、PP send/recv）用 CUDA event 包裹，
+> 事件逐 op 记录、flush 时一次性 `synchronize` 结算——不再每 op 插同步栅栏；**异步** all-reduce
+> （DDP 梯度桶）跑在 DDP 自己的通信流上，无法用计算流上的 event 包裹，改用「启动→future 完成」
+> 的墙钟计时，从而**保留 DDP 原生的反向/通信重叠**。
 
 ### 关键实现约定
 
@@ -90,6 +92,29 @@ libuv 问题）；远程 Linux 用 `torchrun` 即可。
 - **单次时延 vs 总通信时间**：`avg_ms` 是单次 collective 时延，`comm/step` 是次数×时延的
   总和。两者合起来才说明「同步时机」的代价。
 - warmup 步已从汇总中剔除（`meta.json` 里的 `warmup`）。
+
+## 远程 p4 实测解读（4×GPU，hidden=1024/layers=8/seq=512）
+
+| 模式 | step | comm/step | 占比 | 同步点/步 | 单次时延 | 有效带宽 |
+|---|---:|---:|---:|---:|---:|---:|
+| DP | ~370ms | ~251ms | 67.5% | 14 | 17.9ms | ~4.0 GB/s |
+| TP | ~370ms | ~207ms | 54.9% | 32 | 6.5ms | ~3.9 GB/s |
+| PP | ~209ms | ~110ms | 52.8% | 12 | send 0.4~3ms / recv 11~22ms | send 4.7~10.5 / recv 0.3~6 GB/s |
+
+结论：
+
+1. **`autograd::engine::evaluate_function` 占比高是正常的**：它是反向分发器（父节点），
+   CPU total 把 `MmBackward0/BmmBackward0/SoftmaxBackward0` 等所有反向算子的 CPU 时间都算进去，
+   Self CPU 只有 ~0.65%。不是开销，不用管。
+2. **有效带宽 ~4 GB/s 偏低，但要分清「同步等待」与「链路带宽」**：all-reduce 是阻塞的
+   collective，测到的时延里除了真实传输，还包含「所有 rank 都要到达同一 collective 点」的
+   等待（尤其是 DP 旧版的逐 op `synchronize` 把等待放大到 17.9ms）。要定位链路本身，用
+   `nvidia-smi topo -m` 看 NVLink/PCIe 拓扑，或跑一个纯 all-reduce 微基准（扫不同消息大小）
+   分离出峰值带宽。别把「训练里的有效带宽」直接当「链路带宽」。
+3. **PP 的 recv 方差极大（`recv_grad` p95=82ms vs send 0.4ms）是 Gpipe 气泡**：recv 阻塞等
+   下游反向算完，等的时间 = 下游计算 + 同步，正是流水线停顿的量化体现。想压气泡要上 1F1B/VPP。
+4. 早前版本 `--measure-comm` 的逐 collective `synchronize` 会让 DDP 同步化、夸大 backward；
+   现已改为延迟事件 + 异步 all-reduce（见上），**旧数据用新代码重跑一次即可**。
 
 ## 局限与后续
 

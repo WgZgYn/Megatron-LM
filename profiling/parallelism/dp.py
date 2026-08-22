@@ -1,12 +1,10 @@
 """Data parallelism via DDP, with an optional timed gradient all-reduce hook.
 
-The default DDP gradient hook already exposes one all-reduce per gradient
-bucket. ``timed_allreduce_hook`` mirrors it exactly (``tensor.div_(world)``
-then all-reduce — see ``torch.distributed.algorithms.ddp_comm_hooks._allreduce_fut``)
-but performs a *synchronous* all-reduce so ``CommTimer`` can record the
-per-bucket latency and effective bandwidth. When ``measure_comm`` is False the
-default asynchronous hook is kept, so the torch.profiler trace shows realistic
-gradient/backward overlap.
+``timed_allreduce_hook`` mirrors the default DDP hook exactly (``tensor.div_(world)``
+then an async all-reduce — see ``torch.distributed.algorithms.ddp_comm_hooks._allreduce_fut``)
+and additionally times the all-reduce. The all-reduce stays **non-blocking**, so
+DDP keeps its native backward/communication overlap; the latency is measured
+wall-clock from launch to future resolution (see ``comm.CommTimer``).
 """
 
 from __future__ import annotations
@@ -17,22 +15,15 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 def timed_allreduce_hook(timer):
-    """DDP comm hook: divide by world size, time the all-reduce, return a future."""
+    """DDP comm hook: divide by world size, time the async all-reduce, return a future."""
 
     def hook(state, bucket):
         process_group = state  # `state` IS the process group passed to register_comm_hook
         group = process_group if process_group is not None else dist.group.WORLD
-        world_size = group.size()
 
         tensor = bucket.buffer()
-        tensor.div_(world_size)
-        timer.timed_all_reduce(tensor, group=process_group, name="dp_grad_allreduce")
-
-        # The hook contract: return a Future resolving to a *single* tensor
-        # (the default hook does `allreduce(...).get_future().then(lambda f: f.value()[0])`).
-        fut = torch.futures.Future()
-        fut.set_result(tensor)
-        return fut
+        tensor.div_(group.size())
+        return timer.timed_all_reduce_async(tensor, group=process_group, name="dp_grad_allreduce")
 
     return hook
 
