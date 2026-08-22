@@ -93,28 +93,32 @@ libuv 问题）；远程 Linux 用 `torchrun` 即可。
   总和。两者合起来才说明「同步时机」的代价。
 - warmup 步已从汇总中剔除（`meta.json` 里的 `warmup`）。
 
-## 远程 p4 实测解读（4×GPU，hidden=1024/layers=8/seq=512）
+## 远程 p4 实测解读（4×V100-PCIe-16GB，hidden=1024/layers=8/seq=512，FP32）
 
-| 模式 | step | comm/step | 占比 | 同步点/步 | 单次时延 | 有效带宽 |
-|---|---:|---:|---:|---:|---:|---:|
-| DP | ~370ms | ~251ms | 67.5% | 14 | 17.9ms | ~4.0 GB/s |
-| TP | ~370ms | ~207ms | 54.9% | 32 | 6.5ms | ~3.9 GB/s |
-| PP | ~209ms | ~110ms | 52.8% | 12 | send 0.4~3ms / recv 11~22ms | send 4.7~10.5 / recv 0.3~6 GB/s |
+硬件从 trace 的 `deviceProperties` 确认是 **Tesla V100-PCIe**（compute 7.0）：卡间走
+**PCIe 而非 NVLink**，且 FP32 无 tensor core（`volta_sgemm_*` 跑 CUDA core）。
+
+| 模式 | step | NCCL kernel 时间/步 | 占比 | kernel 数/步 | 单次时延 |
+|---|---:|---:|---:|---:|---:|
+| DP | ~335ms | ~271ms | 65.6% | 14 | 19.3ms |
+| TP | ~370ms | ~215ms | 56.8% | 32 | 6.4ms |
+| PP | ~204ms | ~110ms | 58.6% | 12 | send 0.4~3ms / recv 11~27ms |
 
 结论：
 
-1. **`autograd::engine::evaluate_function` 占比高是正常的**：它是反向分发器（父节点），
-   CPU total 把 `MmBackward0/BmmBackward0/SoftmaxBackward0` 等所有反向算子的 CPU 时间都算进去，
-   Self CPU 只有 ~0.65%。不是开销，不用管。
-2. **有效带宽 ~4 GB/s 偏低，但要分清「同步等待」与「链路带宽」**：all-reduce 是阻塞的
-   collective，测到的时延里除了真实传输，还包含「所有 rank 都要到达同一 collective 点」的
-   等待（尤其是 DP 旧版的逐 op `synchronize` 把等待放大到 17.9ms）。要定位链路本身，用
-   `nvidia-smi topo -m` 看 NVLink/PCIe 拓扑，或跑一个纯 all-reduce 微基准（扫不同消息大小）
-   分离出峰值带宽。别把「训练里的有效带宽」直接当「链路带宽」。
-3. **PP 的 recv 方差极大（`recv_grad` p95=82ms vs send 0.4ms）是 Gpipe 气泡**：recv 阻塞等
-   下游反向算完，等的时间 = 下游计算 + 同步，正是流水线停顿的量化体现。想压气泡要上 1F1B/VPP。
-4. 早前版本 `--measure-comm` 的逐 collective `synchronize` 会让 DDP 同步化、夸大 backward；
-   现已改为延迟事件 + 异步 all-reduce（见上），**旧数据用新代码重跑一次即可**。
+1. **`autograd::engine::evaluate_function` 占比高是正常的**（反向分发器父节点，Self CPU 仅
+   ~0.65%）；修复 sync 后它从 ~44% 降到 ~3%，说明之前的高占比是同步测量塞进去的。
+2. **NCCL all-reduce 单次 19.3ms = ~2.5 GB/s，是 V100-PCIe 的硬件现实**，不是测量误差。
+   DP 的梯度 all-reduce（每桶 47.6MB）在 PCIe 上就是这么慢。它**与反向重叠**，所以 DP 的
+   wall-clock step 仍是 compute-bound（~335ms），通信「藏」在 compute 下面。
+3. **PP 的 recv 方差极大（`recv_grad` p95~82ms vs `send_grad` 0.4ms）是 Gpipe 气泡**：recv
+   阻塞等下游算完，正是流水线停顿的量化体现。压气泡要上 1F1B/VPP。
+4. **FP32 无 tensor core，compute 偏慢，把通信盖住了**；换 `--dtype fp16`（V100 tensor core）
+   或 `bf16`（Ampere+）后 compute 大幅缩短，通信会变成瓶颈——这才是研究通信要看的真实场景。
+5. DP 通信时间改从 profiler 的 `ncclDevKernel_*` 读（`comm_kernel_ms_per_step`），DP 的
+   `CommTimer` 墙钟计时不可靠（future 在 kernel 完成前就 resolve），已移除。
+
+## 局限与后续
 
 ## 局限与后续
 

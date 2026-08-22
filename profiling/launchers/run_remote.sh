@@ -15,6 +15,7 @@ set -euo pipefail
 MODE=${1:-dp}
 NGPUS=${2:-4}
 TAG=${3:-$(date +%Y%m%d_%H%M%S)}
+DTYPE=${DTYPE:-fp32}   # fp32 | fp16 (V100 tensor core) | bf16 (Ampere+)
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
@@ -31,9 +32,9 @@ case "$MODE" in
   *) echo "unknown mode: $MODE (expected dp|tp|pp)" >&2; exit 2 ;;
 esac
 
-echo "[launch] mode=$MODE ngpus=$NGPUS tag=$TAG"
+echo "[launch] mode=$MODE ngpus=$NGPUS dtype=$DTYPE tag=$TAG"
 torchrun --nproc_per_node="$NGPUS" --nnodes=1 run.py \
-  --backend nccl --device cuda --tag "$TAG" \
+  --backend nccl --device cuda --dtype "$DTYPE" --tag "$TAG" \
   "${MODEL[@]}" "${COMMON[@]}" "${EXTRA[@]}"
 
 echo "[launch] done. outputs in outputs/${TAG}_${MODE}_p${NGPUS}/"

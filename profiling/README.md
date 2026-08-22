@@ -42,8 +42,39 @@ bash launchers/nsys_wrap.sh pp 4 nsys_pp
 ```
 
 `run.py` 关键参数：`--mode {dp,tp,pp}`、`--steps`、`--warmup`、`--hidden/--layers/--heads/...`、
-`--global-batch`、`--num-microbatches`（PP）、`--profile/--no-profile`、
-`--measure-comm/--no-measure-comm`、`--tag`。
+`--global-batch`、`--num-microbatches`（PP）、`--dtype {fp32,bf16,fp16}`、
+`--profile/--no-profile`、`--measure-comm/--no-measure-comm`、`--tag`。
+
+### 混合精度 / Tensor Core
+
+`--dtype` 用 `torch.autocast` 把前向的 matmul 切到 tensor core：
+
+- **V100**（只有 FP16 tensor core）：用 `--dtype fp16`（带 GradScaler）。
+- **A100/H100**（有 BF16 tensor core）：用 `--dtype bf16`（无需 GradScaler）。
+- 默认 `fp32` = 纯 CUDA core，`volta_sgemm_*` kernel，无 tensor core。
+
+`fp16/bf16` 会大幅缩短 compute，从而把**通信暴露成瓶颈**——这正是研究通信要看的真实场景
+（V100-PCIe 下 FP32 compute 太慢会把 comm 盖住）。
+
+### 通信时间从哪来
+
+- **DP**：梯度 all-reduce 是 DDP 内部的异步操作（跑在自己的 comm stream 上），Python 无法计时；
+  `analyze.py` 从 profiler 的 `ncclDevKernel_*` kernel 时长读 DP 的通信时间（`comm_kernel_ms_per_step`）。
+- **TP/PP**：`CommTimer` 对阻塞的 all-reduce/send/recv 打 CUDA event，`analyze.py` 出 `comm_ms_per_step`。
+
+两者都报，`summary_all.csv` 里 `comm_kernel_ms_per_step`（NCCL kernel 时间）是三模式可比的统一口径。
+
+### nsys 交叉验证
+
+torch.profiler 的时间轴 + `ncclDevKernel_*` 时长是主口径；nsys 用来交叉验证 kernel 级时延与
+CPU 发射间隙/overlap：
+
+```bash
+bash launchers/nsys_wrap.sh dp 4 nsys_dp      # 生成 nsys_dp.nsys-rep
+nsys stats nsys_dp.nsys-rep -r nvtx_sum,cuda_gpu_kern_sum   # 汇总 NVTX 相位 / GPU kernel
+```
+
+对同一个 all-reduce，nsys 的 `NCCL` kernel 时长应与 torch.profiler 的 `ncclDevKernel_*` 一致。
 
 ### 本地（Windows 单卡，无 NCCL）
 

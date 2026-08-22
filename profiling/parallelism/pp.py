@@ -13,7 +13,7 @@ send/recv a clear, separate synchronization point on the timeline.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import torch
 import torch.nn as nn
@@ -94,6 +94,8 @@ def pp_train_step(
     device,
     optimizer,
     loss_fn,
+    autocast_ctx=None,
+    scaler=None,
 ):
     """One Gpipe-style step: forward all microbatches, then backward in reverse.
 
@@ -102,6 +104,9 @@ def pp_train_step(
     the last stage consumes ``labels``. Returns the loss on the last stage (or
     ``None`` elsewhere).
     """
+    if autocast_ctx is None:
+        autocast_ctx = nullcontext()
+
     M = len(microbatches)
     mb, seq = microbatches[0][0].shape
     act_shape = (mb, seq, hidden)
@@ -121,11 +126,13 @@ def pp_train_step(
                 x = torch.empty(*act_shape, device=device, dtype=dtype)
                 timer.timed_recv(x, prev_rank, tag=m, name="pp_recv_act")
             x = x.requires_grad_(True)
-            x_out = stage.body(x)
+            with autocast_ctx:
+                x_out = stage.body(x)
 
             if rank == pp_size - 1:
-                logits = stage.head(x_out)
-                loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+                with autocast_ctx:
+                    logits = stage.head(x_out)
+                    loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
                 saved.append((x, x_out, loss))
             else:
                 timer.timed_send(x_out, next_rank, tag=m, name="pp_send_act")
@@ -136,7 +143,10 @@ def pp_train_step(
         for m in reversed(range(M)):
             x, x_out, mb_loss = saved[m]
             if rank == pp_size - 1:
-                mb_loss.backward()
+                if scaler is not None:
+                    scaler.scale(mb_loss).backward()
+                else:
+                    mb_loss.backward()
             else:
                 grad = torch.empty(*act_shape, device=device, dtype=dtype)
                 timer.timed_recv(grad, next_rank, tag=m + M, name="pp_recv_grad")
@@ -149,6 +159,10 @@ def pp_train_step(
                 timer.timed_send(grad_x, prev_rank, tag=m + M, name="pp_send_grad")
 
     with _nvtx("optimizer"):
-        optimizer.step()
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         optimizer.zero_grad(set_to_none=True)
     return loss

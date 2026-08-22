@@ -62,6 +62,27 @@ def _load_jsonl(paths):
     return records
 
 
+def _ncck_from_profiler(out_dir, warmup, num_steps):
+    """Extract NCCL kernel GPU time + call count from key_averages JSON.
+
+    This is the authoritative comm metric for DP (whose async gradient
+    all-reduce runs on DDP's comm stream and cannot be timed from Python) and a
+    cross-check for TP/PP. Returns (ms_per_step, kernels_per_step), averaged
+    over ranks and over the measured (post-warmup) steps.
+    """
+    measured = max(1, num_steps - warmup)
+    per_rank_ms, per_rank_kernels = [], []
+    for path in sorted(glob.glob(os.path.join(out_dir, "key_averages_rank*.json"))):
+        with open(path, encoding="utf-8") as f:
+            rows = json.load(f)
+        ncck = [r for r in rows if r["name"].startswith("ncclDevKernel_")]
+        per_rank_ms.append(sum(r["cuda_time_total_us"] for r in ncck) / 1000 / measured)
+        per_rank_kernels.append(sum(r["count"] for r in ncck) / measured)
+    ms = statistics.fmean(per_rank_ms) if per_rank_ms else 0.0
+    kernels = statistics.fmean(per_rank_kernels) if per_rank_kernels else 0.0
+    return ms, kernels
+
+
 def load_mode(out_dir):
     """Load all artifacts of one run directory into an analysis dict."""
     meta_path = os.path.join(out_dir, "meta.json")
@@ -72,6 +93,8 @@ def load_mode(out_dir):
         meta = json.load(f)
 
     warmup = int(meta.get("warmup", 0))
+    num_steps = int(meta.get("steps", 0))
+    comm_kernel_ms, ncck_per_step = _ncck_from_profiler(out_dir, warmup, num_steps)
     comm = _load_jsonl(sorted(glob.glob(os.path.join(out_dir, "comm_rank*.jsonl"))))
     steps = _load_jsonl(sorted(glob.glob(os.path.join(out_dir, "steps_rank*.jsonl"))))
 
@@ -121,8 +144,11 @@ def load_mode(out_dir):
         "per_op": per_op,
         "comm_ms_per_step": comm_ms_per_step,
         "syncs_per_step": syncs_per_step,
+        "comm_kernel_ms_per_step": comm_kernel_ms,
+        "ncck_kernels_per_step": ncck_per_step,
         "step_ms": step_ms,
         "comm_fraction_pct": 100.0 * comm_ms_per_step / step_ms if step_ms > 0 else 0.0,
+        "comm_kernel_fraction_pct": 100.0 * comm_kernel_ms / step_ms if step_ms > 0 else 0.0,
         "effective_gbps": effective_gbps,
         "avg_call_ms": statistics.fmean(r["ms"] for r in comm) if comm else 0.0,
     }
@@ -132,9 +158,11 @@ def print_tables(results):
     for res in results:
         mode = res["mode"]
         print(f"\n=== {mode} (world={res['world_size']}) — {res['out_dir']} ===")
-        print(f"  step time {res['step_ms']:.2f} ms | comm/step {res['comm_ms_per_step']:.2f} ms "
-              f"({res['comm_fraction_pct']:.1f}%) | {res['syncs_per_step']:.1f} syncs/step | "
-              f"effective {res['effective_gbps']:.2f} GB/s")
+        print(f"  step time {res['step_ms']:.2f} ms")
+        print(f"  NCCL kernel comm {res['comm_kernel_ms_per_step']:.2f} ms/step "
+              f"({res['comm_kernel_fraction_pct']:.1f}% of step, {res['ncck_kernels_per_step']:.1f} kernels/step)")
+        print(f"  blocking collectives (CommTimer) {res['comm_ms_per_step']:.2f} ms/step "
+              f"({res['syncs_per_step']:.1f} calls/step, effective {res['effective_gbps']:.2f} GB/s)")
         print(f"  {'op':24} {'count':>7} {'avg_ms':>9} {'p95_ms':>9} {'avg_GB/s':>10} {'total_MB':>9}")
         print("  " + "-" * 78)
         for op in sorted(res["per_op"]):
@@ -145,8 +173,10 @@ def print_tables(results):
 
 def write_csvs(results, base_dir):
     per_op_fields = ["op", "count", "avg_ms", "p95_ms", "total_ms", "total_bytes", "avg_gbps"]
-    strat_fields = ["mode", "world_size", "step_ms", "comm_ms_per_step", "comm_fraction_pct",
-                    "syncs_per_step", "effective_gbps", "avg_call_ms"]
+    strat_fields = ["mode", "world_size", "step_ms", "comm_kernel_ms_per_step",
+                    "comm_kernel_fraction_pct", "ncck_kernels_per_step",
+                    "comm_ms_per_step", "comm_fraction_pct", "syncs_per_step",
+                    "effective_gbps", "avg_call_ms"]
 
     strat_rows = []
     for res in results:
@@ -182,9 +212,9 @@ def plot_comparison(results, base_dir):
 
     fig, axes = plt.subplots(1, 3, figsize=(13, 3.8), facecolor=SURFACE)
     panels = [
-        ("comm_ms_per_step", "Comm time / step (ms)", "ms"),
-        ("effective_gbps", "Effective bandwidth (GB/s)", "GB/s"),
-        ("comm_fraction_pct", "Comm share of step time", "%"),
+        ("comm_kernel_ms_per_step", "NCCL comm time / step (ms)", "ms"),
+        ("ncck_kernels_per_step", "NCCL kernels / step", "count"),
+        ("comm_kernel_fraction_pct", "Comm share of step (kernel time)", "%"),
     ]
 
     for ax, (key, title, unit) in zip(axes, panels):

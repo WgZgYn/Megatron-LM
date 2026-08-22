@@ -1,19 +1,16 @@
 """Communication timing utilities.
 
-``CommTimer`` logs every collective (op, byte count, latency, effective
-bandwidth) to a per-rank JSONL consumed by ``analyze.py``.
+``CommTimer`` logs each *blocking* collective (TP ``all_reduce``, PP
+``send``/``recv``) to a per-rank JSONL consumed by ``analyze.py``.
 
-Two timing paths, chosen by whether the collective is *blocking*:
+Timing is CUDA-event based and **deferred**: events bracket each collective on
+the compute stream, but the device is only synchronised once at ``flush()``,
+so no extra sync barrier is inserted into the training step.
 
-* **Blocking collectives** (TP ``all_reduce``, PP ``send``/``recv``) — timed with
-  CUDA events that bracket the kernel on the compute stream. Events are recorded
-  per-op but resolved in one ``torch.cuda.synchronize()`` at flush time, so no
-  extra sync barrier is inserted into the step (this used to distort the trace).
-* **Async all-reduce** (DDP gradient buckets) — the all-reduce is non-blocking
-  and runs on DDP's communication stream, so it cannot be bracketed with events
-  on the compute stream. It is timed wall-clock from launch to future
-  resolution instead, which preserves DDP's native backward/communication
-  overlap.
+DP's gradient all-reduce is *not* timed here: DDP runs it on its own
+communication stream (a CUDA event on the compute stream cannot bracket it, and
+wall-clock resolves before the kernel finishes). DP communication is instead
+read from the torch.profiler NCCL kernel durations by ``analyze.py``.
 
 Bandwidth convention: ``all_reduce`` reports effective bytes
 ``2 * (n - 1) / n * numel * element_size`` (ring approximation); point-to-point
@@ -151,26 +148,3 @@ class CommTimer:
             t0 = time.perf_counter()
             dist.recv(tensor, src, tag=tag)
             self._record(name, num_bytes, (time.perf_counter() - t0) * 1e3, src=src, tag=tag)
-
-    # -- async all-reduce (DDP gradient buckets) ----------------------------
-
-    def timed_all_reduce_async(self, tensor, group=None, name="all_reduce"):
-        """Launch a non-blocking all-reduce and time it wall-clock until done.
-
-        Returns a ``torch.futures.Future`` (for the DDP comm hook contract).
-        Wall-clock is used because DDP runs the NCCL kernel on its own
-        communication stream, which CUDA events on the compute stream cannot
-        bracket.
-        """
-        num_bytes = self._ring_bytes(tensor, group)
-        t0 = time.perf_counter()
-        handle = dist.all_reduce(tensor, group=group, async_op=True)
-
-        if not self.enabled:
-            return handle.get_future().then(lambda f: f.value()[0])
-
-        def _done(f):
-            self._record(name, num_bytes, (time.perf_counter() - t0) * 1e3)
-            return f.value()[0]
-
-        return handle.get_future().then(_done)
